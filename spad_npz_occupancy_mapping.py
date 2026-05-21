@@ -85,6 +85,8 @@ def mp_find_peaks(
     匹配追踪峰值检测算法，核心思想：面前有一堆沙子，里面混着几颗大小不同的石头。匹配追踪算法的做法是：
     先找到最大的那颗石头，把它捡出来，然后在剩下的沙子里，再找下一颗最大的石头，重复这个过程，直到捡够了指定数量的石头，或者剩下的都是沙子
     沙子 = 背景噪声，石头 = 真实的反射峰值，每次找到一个峰值后，就把它周围的区域 "擦除"，避免重复检测同一个峰
+
+    先做一次卷积找当前最强峰，找到后把峰附近一段 support_radius（支持半径） 置零，再找下一个峰，重复直到找到 max_peaks 个，或者分数低于阈值
     """
     h_res = hist.copy()
     kernel = gaussian_kernel_1d(sigma_bins, support_radius)  # 生成一个一维的高斯核函数，用来匹配峰值的模板，它的形状和 SPAD 传感器的脉冲响应形状是一样的
@@ -346,6 +348,60 @@ def peak_valley_bounds_numba(pdf, peak_idx):
 
 
 @njit(cache=True, fastmath=True)
+def cdf_lookup_numba(r_grid_m, cdf_grid, x):
+    """Step-CDF lookup: return accumulated posterior mass for r <= x."""
+    """
+    给定严格升序排列的候选距离数组r_grid_m和对应的累积分布函数数组cdf_grid，返回距离小于等于查询值x的累积后验概率
+
+    r_grid_m:升序排列的候选距离网格，单位：米（由compute_ll_grid_numba生成）
+    cdf_grid:与r_grid_m一一对应的累积分布函数值，cdf_grid[i] = P(r ≤ r_grid_m[i])
+    x:待查询的距离值
+    """
+    n = r_grid_m.size
+    if n == 0:
+        return 0.0
+    if x < r_grid_m[0]:
+        return 0.0
+    if x >= r_grid_m[n - 1]:
+        return 1.0
+
+    lo = 0
+    hi = n
+    while lo < hi:
+        mid = (lo + hi) // 2
+        
+        # 如果r_grid_m[mid] ≤ x,说明最后一个≤x 的元素一定在mid的右侧（包括mid），因此将左边界移到mid + 1
+        if r_grid_m[mid] <= x:
+            lo = mid + 1
+        
+        # 如果r_grid_m[mid] > x,说明最后一个≤x 的元素一定在mid的左侧，因此将右边界移到mid
+        else:
+            hi = mid
+        # 循环终止条件：lo == hi，此时lo指向第一个大于x的元素的索引
+
+    idx = lo - 1  # 因为lo是第一个大于x的元素索引，所以lo-1就是最后一个≤x 的元素的索引
+    if idx < 0:
+        return 0.0
+    v = cdf_grid[idx]
+    if v < 0.0:
+        return 0.0
+    if v > 1.0:
+        return 1.0
+    return v
+
+
+@njit(cache=True, fastmath=True)
+def logit_numba(p):
+    """Numerically stable logit for numba code."""
+    if p < 1e-6:
+        p = 1e-6
+    elif p > 1.0 - 1e-6:
+        p = 1.0 - 1e-6
+    
+    return math.log(p / (1.0 - p))
+
+
+@njit(cache=True, fastmath=True)
 def dda_update_dense(
     Lgrid, origin, d, end_dist, mins, voxel,
     nx, ny, nz, rm_arr, rp_arr, K,
@@ -503,6 +559,161 @@ def dda_update_dense(
                 tMaxZ += tDeltaZ
 
 
+@njit(cache=True, fastmath=True)
+def dda_update_dense_cdf(
+    Lgrid, origin, d, end_dist, mins, voxel,
+    nx, ny, nz, r_grid_m, cdf_grid, n_hyp,
+    Lmin, Lmax, logit_p0, p_occ, p_free, range_model_is_range,
+):
+    """DDA ray update using CDF-marginalized voxel occupancy probability."""
+    """
+    沿着一条相机/SPAD ray 穿过 3D voxel grid，把完整的距离后验CDF融合成 occupancy log-odds 地图
+    Lgrid:三维对数几率栅格数组，形状为(nx, ny, nz)，存储每个体素的占用概率;origin:相机在世界坐标系中的原点坐标 (x, y, z);d:射线的单位方向向量
+    end_dist:传感器的最大有效测量距离;mins:栅格地图的最小世界坐标 (min_x, min_y, min_z);voxel:体素的边长（单位：米）
+    nx, ny, nz:栅格地图在 x、y、z 三个方向上的体素数量;r_grid_m:升序排列的候选距离网格，单位：米;cdf_grid:与r_grid_m一一对应的累积分布函数值
+    n_hyp:距离假设点的总数量;Lmin, Lmax:对数几率的最小值和最大值，防止数值溢出;logit_p0:先验占用概率的对数几率值
+    p_occ:物体在体素内部时的观测占用概率;p_free:物体在体素后面时的观测占用概率;range_model_is_range:距离模型标志，和之前生成三维点时的参数一致
+
+    输入：
+    一条 ray 的起点 origin
+    一条 ray 的方向 d
+    这条 ray 上完整的距离后验累积分布函数 (r_grid_m, cdf_grid)
+    当前 3D 地图 Lgrid
+
+    1.把 ray 起点和终点转换成 voxel 坐标
+    2.用 DDA 沿 ray 遍历 voxel
+    3.计算每个 voxel 沿 ray 的距离 rho
+    4.根据 rho 和完整后验CDF计算体素占用概率并更新 log-odds
+        计算体素沿射线的前后边界 a_v 和 b_v
+        查询CDF得到物体在体素前面的概率 Fa 和物体在体素前面或内部的概率 Fb
+        推导物体在体素内部的概率 hit = Fb - Fa 和物体在体素后面的概率 behind = 1 - Fb
+        概率加权得到体素的单次观测占用概率 P_v = 0.5*Fa + p_occ*hit + p_free*behind
+        用贝叶斯规则更新对数几率：L += logit(P_v) - logit_p0
+        对更新后的对数几率进行数值钳位，防止溢出
+    """
+    # 将相机原点（射线起点）从世界坐标系转换为连续的体素坐标
+    # origin：相机在世界坐标系中的位置，代码中固定为(0,0,0);mins：栅格地图在世界坐标系中的最小边界，默认是(-5, -5, 0);voxel：体素的边长，默认是0.1米
+    v0x = (origin[0] - mins[0]) / voxel
+    v0y = (origin[1] - mins[1]) / voxel
+    v0z = (origin[2] - mins[2]) / voxel
+
+    # 计算射线在最大有效距离处的终点，并转换为连续的体素坐标
+    # d：射线的单位方向向量，表示这条射线在三维空间中的指向;end_dist：传感器的最大有效测量距离，默认是5.0米
+    v1x = (origin[0] + d[0] * end_dist - mins[0]) / voxel
+    v1y = (origin[1] + d[1] * end_dist - mins[1]) / voxel
+    v1z = (origin[2] + d[2] * end_dist - mins[2]) / voxel
+
+    # 将连续的体素坐标向下取整，得到射线起点和终点所在的体素整数索引
+    x = int(math.floor(v0x))
+    y = int(math.floor(v0y))
+    z = int(math.floor(v0z))
+    x1 = int(math.floor(v1x))
+    y1 = int(math.floor(v1y))
+    z1 = int(math.floor(v1z))
+
+    # 计算射线在体素坐标系中的总位移向量
+    dx = v1x - v0x
+    dy = v1y - v0y
+    dz = v1z - v0z
+
+    # 确定射线在每个轴上的步进方向
+    sx = 1 if dx > 0.0 else (-1 if dx < 0.0 else 0)
+    sy = 1 if dy > 0.0 else (-1 if dy < 0.0 else 0)
+    sz = 1 if dz > 0.0 else (-1 if dz < 0.0 else 0)
+
+    # DDA的核心思想：一条射线穿过体素网格时，每次只会穿过一个体素的边界。我们只需要每次找到最近的那个边界，走过去，然后重复这个过程，直到到达射线终点
+    # 把射线用参数t进行参数化，pos(t)=start+t·(end−start)，计算走到下一个 x 边界需要多少t？走到下一个 y 边界需要多少t？走到下一个 z 边界需要多少t？
+    # 哪个需要的t最小，就先走到哪个边界
+    if dx == 0.0:
+        tMaxX = 1e30
+        tDeltaX = 1e30
+    else:
+        next_boundary = (x + 1) if sx > 0 else x
+        
+        # 从射线起点到下一个 x 边界的距离 / 射线从起点到终点在 x 方向的总位移 = 从射线起点出发，走到下一个 x 边界所需要的t值
+        tMaxX = (next_boundary - v0x) / dx
+        tDeltaX = 1.0 / abs(dx)  # 每跨过一个 x 体素需要的t
+
+    if dy == 0.0:
+        tMaxY = 1e30
+        tDeltaY = 1e30
+    else:
+        next_boundary = (y + 1) if sy > 0 else y
+        tMaxY = (next_boundary - v0y) / dy
+        tDeltaY = 1.0 / abs(dy)
+
+    if dz == 0.0:
+        tMaxZ = 1e30
+        tDeltaZ = 1e30
+    else:
+        next_boundary = (z + 1) if sz > 0 else z
+        tMaxZ = (next_boundary - v0z) / dz
+        tDeltaZ = 1.0 / abs(dz)
+
+    max_steps = 20000
+    for _ in range(max_steps):
+        if x == x1 and y == y1 and z == z1:
+            break  # 当当前体素就是射线终点所在的体素时，退出循环
+
+        if 0 <= x < nx and 0 <= y < ny and 0 <= z < nz:
+            # 计算体素中心的世界坐标，体素索引x对应的是体素的左边界坐标，体素 x 的 x 坐标范围是：[mins[0] + x*voxel, mins[0] + (x+1)*voxel)
+            # 所以体素的中心坐标就是 mins[0] + voxel*(x+0.5)
+            cx = mins[0] + voxel * (x + 0.5)
+            cy = mins[1] + voxel * (y + 0.5)
+            cz = mins[2] + voxel * (z + 0.5)
+
+            if range_model_is_range:
+                # 体素中心到相机原点的沿射线距离
+                rho = d[0] * (cx - origin[0]) + d[1] * (cy - origin[1]) + d[2] * (cz - origin[2])
+            else:
+                rho = cz
+
+            if rho > 0.0 and rho <= end_dist and n_hyp > 0:
+                # 计算体素沿射线方向的前后边界距离
+                a_v = rho - 0.5 * voxel
+                b_v = rho + 0.5 * voxel
+                
+                # 查询 CDF 得到累积概率
+                Fa = cdf_lookup_numba(r_grid_m, cdf_grid, a_v)  # Fa = P(r ≤ a_v)：物体在体素前面的概率，体素被遮挡，无法得知状态，保持先验概率0.5
+                Fb = cdf_lookup_numba(r_grid_m, cdf_grid, b_v)  # Fb = P(r ≤ b_v)：物体在体素前面或内部的概率
+
+                hit = Fb - Fa  # 物体正好在体素内部，概率为hit = Fb - Fa，此时体素被物体占据，所以占用概率为p_occ
+                if hit < 0.0:
+                    hit = 0.0
+                behind = 1.0 - Fb  # 物体在体素后面，概率为behind = 1 - Fb，体素是自由的，占用概率为p_free
+                if behind < 0.0:
+                    behind = 0.0
+
+                P_v = 0.5 * Fa + p_occ * hit + p_free * behind  # 计算体素的单次观测占用概率
+                if P_v < 1e-6:
+                    P_v = 1e-6
+                if P_v > 1.0 - 1e-6:
+                    P_v = 1.0 - 1e-6
+
+                # 贝叶斯对数几率更新
+                L = Lgrid[x, y, z] + logit_numba(P_v) - logit_p0
+                if L < Lmin:
+                    L = Lmin
+                if L > Lmax:
+                    L = Lmax
+                Lgrid[x, y, z] = L
+
+        if tMaxX < tMaxY:
+            if tMaxX < tMaxZ:
+                x += sx
+                tMaxX += tDeltaX
+            else:
+                z += sz
+                tMaxZ += tDeltaZ
+        else:
+            if tMaxY < tMaxZ:
+                y += sy
+                tMaxY += tDeltaY
+            else:
+                z += sz
+                tMaxZ += tDeltaZ
+
+
 def write_occ_slice(path: str, Lgrid: np.ndarray, z_slice: float, z_min: float, voxel: float, p0: float) -> None:
     out_dir = os.path.dirname(path)
     if out_dir:
@@ -615,7 +826,7 @@ def parse_args() -> argparse.Namespace:
     # 距离计算模型："z"：仅用 z 坐标作为距离（2.5D 俯视模式）；"range"：标准 3D 射线距离
     # 俯视场景（比如无人机）用 "z"，普通 3D 场景（比如地面机器人）必须改成 "range"
     ap.add_argument("--range_model", choices=["range", "z"], default="range")
-    ap.add_argument("--max_peaks", type=int, default=1)  # 每条射线最多检测多少个峰
+    ap.add_argument("--max_peaks", type=int, default=2)  # 每条射线最多检测多少个峰
     
     # 匹配追踪 (MP) 峰值检测阈值，卷积响应小于这个值的峰不会被检测到，控制峰值检测的灵敏度
     # 调大：只检测明显的峰，减少假阳性；调小：检测更多弱峰，可能引入噪声
@@ -623,7 +834,7 @@ def parse_args() -> argparse.Namespace:
     
     # 峰值支持半径，单位：bin，0 表示自动设为 4×--sigma_bins，检测到一个峰后，会把这个半径内的直方图置零
     ap.add_argument("--mp_support", type=int, default=0, help="support radius in bins, 0=auto(4*sigma)")
-    ap.add_argument("--occ_wmax_vox", type=float, default=2.5)  # 每个占用区间的最大宽度，单位：体素，防止异常长的占用区间
+    ap.add_argument("--occ_wmax_vox", type=float, default=2.5)  # 旧 interval update（区间更新）参数；CDF 更新不再使用
     
     # 导出占据体素的最小概率阈值，只有概率大于等于这个值的体素才会被导出
     ap.add_argument(
@@ -708,9 +919,8 @@ def main() -> None:
     end_dist = float(args.range_max)  # 每条射线的最大遍历距离，单位：米
     range_model_is_range = args.range_model == "range"
     
-    # 算公式 12 单次观测的对数几率增量
-    dL_free = float(logit(args.p_free) - logit(args.p0))
-    dL_occ = float(logit(args.p_occ) - logit(args.p0))
+    # CDF update（累积分布函数更新）使用完整后验概率计算每个 voxel（体素）的单次观测概率
+    logit_p0 = float(logit(args.p0))
     
     # 对数几率的上下限
     Lmin = float(args.Lmin)
@@ -728,7 +938,9 @@ def main() -> None:
         h = hist_data[idx]  # 取出它的光子直方图
         
         # 检测直方图中的所有显著峰值
-        peaks, _ = mp_find_peaks(
+        # peaks：检测到的峰值位置列表，每个元素是峰值所在的时间 bin 索引
+        # peak_scores：对应峰值的置信度分数列表，分数越高表示这个峰越可能是真实的物体反射
+        peaks, peak_scores = mp_find_peaks(
             h,
             max_peaks=args.max_peaks,
             sigma_bins=args.sigma_bins,
@@ -739,10 +951,16 @@ def main() -> None:
         if len(peaks) == 0:
             continue
 
-        intervals = []  # 存储这条射线所有的占用区间，每个元素是一个元组(rm, rp)，表示墙最可能存在于[rm, rp]米之间
+        peak_posteriors_r = []  # 存储每个峰值对应的距离网格数组
+        peak_posteriors_p = []  # 存储每个峰值对应的后验概率分布数组，与peak_posteriors_r一一对应
         profile_points = []  # 存储这条射线所有的表面点信息，每个元素是一个元组(peak_depth, peak_conf)，表示在peak_depth米处有一个表面点，置信度为peak_conf
-        wmax = float(args.occ_wmax_vox) * voxel  # 计算占用区间的最大允许宽度，默认值：2.5 × 0.1 = 0.25米
-        for pk in peaks:
+
+        total_peak_score = float(sum(max(float(s), 0.0) for s in peak_scores))  # 计算总分数
+        if total_peak_score <= 0.0:
+            total_peak_score = float(len(peaks))  # 如果总分数为 0，就用峰值的数量代替总分数，这样每个峰值的权重就相等
+
+        # pk：当前峰值所在的时间 bin 索引;pk_score：当前峰值的匹配追踪分数，分数越高表示这个峰越可能是真实的物体反射，而非噪声
+        for pk, pk_score in zip(peaks, peak_scores):
             # r_grid_m：距离数组，每个元素对应一个候选距离 r，单位为米；pdf_grid：距离后验概率密度函数，pdf_grid[i]：表示墙在r_grid_m[i]米处的概率
             r_grid_m, _, pdf_grid = compute_ll_grid_numba(
                 h,
@@ -754,42 +972,41 @@ def main() -> None:
                 float(args.tau),
                 float(bin_to_m),
             )
+            peak_weight = max(float(pk_score), 0.0) / total_peak_score  # 计算当前峰值的权重
             pk_local = int(np.argmax(pdf_grid))  # 返回pdf_grid数组中最大值所在的索引
             peak_depth = float(r_grid_m[pk_local])  # 用刚才找到的概率峰值索引，去距离网格中取出对应的实际距离
             peak_conf = float(pdf_grid[pk_local])  # 取出概率峰值处的概率值
-            l, r = peak_valley_bounds_numba(pdf_grid, pk_local)
-            rm = float(r_grid_m[l])  # 峰值区间的左边界（单位：米）
-            rp = float(r_grid_m[r])  # 峰值区间的右边界（单位：米）
-            if rp - rm > wmax:  # 计算原始区间的宽度：rp - rm,如果宽度超过预设的最大值wmax
-                c = 0.5 * (rm + rp)  # 计算原始区间的中心c
-                
-                # 生成一个以c为中心、宽度正好是wmax的对称区间,用这个新的窄区间替换原来的宽区间
-                rm = c - 0.5 * wmax
-                rp = c + 0.5 * wmax
-            if rp <= 0.0 or rm >= end_dist:
+            if peak_depth <= 0.0 or peak_depth > end_dist:
                 continue
-            
-            # 裁剪区间边界到有效范围内
-            rm = max(0.0, min(end_dist, rm))
-            rp = max(0.0, min(end_dist, rp))
-            
-            # 如果区间有效，就把区间加入intervals列表，同时把对应的峰值深度和置信度加入profile_points列表
-            if rp > rm:
-                intervals.append((rm, rp))
-                profile_points.append((peak_depth, peak_conf))
 
-        if len(intervals) == 0:
+            peak_posteriors_r.append(r_grid_m)  # 将当前峰值的距离网格存入列表
+            peak_posteriors_p.append(pdf_grid * peak_weight)  # 将当前峰值的后验概率分布乘以权重后存入列表。这一步实现了按置信度加权
+            profile_points.append((peak_depth, peak_conf))  # 将当前峰值对应的表面点存入列表，后续会导出为 PLY 文件
+
+        if len(peak_posteriors_r) == 0:
             continue
-        
-        # 所有峰值按照从近到远的顺序排列
-        intervals.sort(key=lambda t: t[0])  # lambda 是 Python 中的匿名函数,lambda t: 表示这个函数接收一个参数 t,t[0] 表示返回参数 t 的第 0 个元素
 
-        Kint = min(len(intervals), 8)  # 最多保留 8 个峰值
-        rm_arr = np.zeros(Kint, dtype=np.float64)  # 所有峰值区间的左边界数组
-        rp_arr = np.zeros(Kint, dtype=np.float64)  # 所有峰值区间的右边界数组
-        for i in range(Kint):
-            rm_arr[i] = intervals[i][0]
-            rp_arr[i] = intervals[i][1]
+        # 如果只检测到一个有效峰值，直接使用这个峰值的距离网格和加权后的概率分布
+        if len(peak_posteriors_r) == 1:
+            ray_r = np.asarray(peak_posteriors_r[0], dtype=np.float64)
+            ray_p = np.asarray(peak_posteriors_p[0], dtype=np.float64)
+        else:
+            # 拼接所有峰值的后验数组,np.concatenate将所有峰值的距离网格和加权后的概率分布分别拼接成两个一维数组
+            # 例如：如果检测到 2 个峰值，每个峰值有 81 个采样点，那么拼接后的ray_r和ray_p的长度都是 162
+            ray_r = np.concatenate([np.asarray(arr, dtype=np.float64) for arr in peak_posteriors_r])
+            ray_p = np.concatenate([np.asarray(arr, dtype=np.float64) for arr in peak_posteriors_p])
+            
+            # 按距离升序排序
+            order = np.argsort(ray_r)
+            ray_r = ray_r[order]
+            ray_p = ray_p[order]
+
+        total_prob = float(ray_p.sum())
+        if total_prob <= 0.0:
+            continue
+        ray_p /= total_prob  #  概率归一化
+        ray_cdf = np.cumsum(ray_p)  # 计算累积分布函数 (CDF)
+        ray_cdf[-1] = 1.0
 
         d = np.array([float(x_n_all[idx]), float(y_n_all[idx]), 1.0], dtype=np.float64)  # 构建这条射线的方向向量
         nrm = np.linalg.norm(d)  # 计算d的模长
@@ -807,11 +1024,11 @@ def main() -> None:
                 p3 = d * scale
             surface_points.append((float(p3[0]), float(p3[1]), float(p3[2]), float(peak_conf)))  # surface_points列表:带置信度的三维点云
 
-        # 把当前这一条 ray 的结果写进 3D occupancy map
-        dda_update_dense(
+        # 把当前这一条 ray 的 CDF 后验结果写进 3D occupancy map
+        dda_update_dense_cdf(
             Lgrid, origin, d, end_dist, mins, voxel,
-            nx, ny, nz, rm_arr, rp_arr, Kint,
-            Lmin, Lmax, dL_free, dL_occ,
+            nx, ny, nz, ray_r, ray_cdf, int(ray_r.size),
+            Lmin, Lmax, logit_p0, float(args.p_occ), float(args.p_free),
             range_model_is_range,
         )
 
