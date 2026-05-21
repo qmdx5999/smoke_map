@@ -1,0 +1,7 @@
+__pycache__/
+*.npz
+*.ply
+data
+*.pdf
+*.png
+mapping
