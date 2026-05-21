@@ -401,6 +401,43 @@ def logit_numba(p):
     return math.log(p / (1.0 - p))
 
 
+def posterior_entropy_weight(pdf: np.ndarray, w_min: float = 0.2) -> float:
+    """
+    Convert posterior dispersion into an adaptive update weight.
+    Sharp posteriors get weights near 1; broad posteriors get weights near w_min.
+    """
+    """
+    pdf:合并后的距离后验概率分布数组（就是main函数中的ray_p）
+    w_min:最小更新权重，默认 0.2。即使是最不确定的测量，也至少保留 20% 的更新强度
+    """
+    p = np.asarray(pdf, dtype=np.float64)
+    n = int(p.size)  # n是后验分布的采样点数量（默认单峰 81 个，双峰最多 162 个）
+    if n <= 1:
+        return 1.0
+
+    s = float(p.sum())
+    if s <= 0.0 or not np.isfinite(s):
+        return float(w_min)
+
+    p = p / s  # 将后验分布归一化，确保所有概率值的总和为 1
+    valid = p > 0.0  # 找出所有大于 0 的概率值
+    if not np.any(valid):
+        return float(w_min)
+
+    entropy = -float(np.sum(p[valid] * np.log(p[valid])))  # 信息熵的标准计算公式,计算后验分布的熵
+    
+    # 熵的归一化
+    entropy_norm = entropy / max(math.log(float(n)), 1e-12)
+    entropy_norm = max(0.0, min(1.0, entropy_norm))
+
+    w_min = max(0.0, min(1.0, float(w_min)))
+    
+    # 当entropy_norm=0（完全确定）：权重 = w_min + (1-w_min)*1 = 1.0
+    # 当entropy_norm=1（完全不确定）：权重 = w_min + (1-w_min)*0 = w_min
+    # 中间值线性插值
+    return w_min + (1.0 - w_min) * (1.0 - entropy_norm)
+
+
 @njit(cache=True, fastmath=True)
 def dda_update_dense(
     Lgrid, origin, d, end_dist, mins, voxel,
@@ -563,7 +600,7 @@ def dda_update_dense(
 def dda_update_dense_cdf(
     Lgrid, origin, d, end_dist, mins, voxel,
     nx, ny, nz, r_grid_m, cdf_grid, n_hyp,
-    Lmin, Lmax, logit_p0, p_occ, p_free, range_model_is_range,
+    Lmin, Lmax, logit_p0, p_occ, p_free, update_weight, range_model_is_range,
 ):
     """DDA ray update using CDF-marginalized voxel occupancy probability."""
     """
@@ -572,7 +609,8 @@ def dda_update_dense_cdf(
     end_dist:传感器的最大有效测量距离;mins:栅格地图的最小世界坐标 (min_x, min_y, min_z);voxel:体素的边长（单位：米）
     nx, ny, nz:栅格地图在 x、y、z 三个方向上的体素数量;r_grid_m:升序排列的候选距离网格，单位：米;cdf_grid:与r_grid_m一一对应的累积分布函数值
     n_hyp:距离假设点的总数量;Lmin, Lmax:对数几率的最小值和最大值，防止数值溢出;logit_p0:先验占用概率的对数几率值
-    p_occ:物体在体素内部时的观测占用概率;p_free:物体在体素后面时的观测占用概率;range_model_is_range:距离模型标志，和之前生成三维点时的参数一致
+    p_occ:物体在体素内部时的观测占用概率;p_free:物体在体素后面时的观测占用概率;update_weight:基于后验熵的自适应更新权重
+    range_model_is_range:距离模型标志，和之前生成三维点时的参数一致
 
     输入：
     一条 ray 的起点 origin
@@ -588,7 +626,7 @@ def dda_update_dense_cdf(
         查询CDF得到物体在体素前面的概率 Fa 和物体在体素前面或内部的概率 Fb
         推导物体在体素内部的概率 hit = Fb - Fa 和物体在体素后面的概率 behind = 1 - Fb
         概率加权得到体素的单次观测占用概率 P_v = 0.5*Fa + p_occ*hit + p_free*behind
-        用贝叶斯规则更新对数几率：L += logit(P_v) - logit_p0
+        用贝叶斯规则更新对数几率：L += update_weight * (logit(P_v) - logit_p0)
         对更新后的对数几率进行数值钳位，防止溢出
     """
     # 将相机原点（射线起点）从世界坐标系转换为连续的体素坐标
@@ -691,7 +729,7 @@ def dda_update_dense_cdf(
                     P_v = 1.0 - 1e-6
 
                 # 贝叶斯对数几率更新
-                L = Lgrid[x, y, z] + logit_numba(P_v) - logit_p0
+                L = Lgrid[x, y, z] + update_weight * (logit_numba(P_v) - logit_p0)
                 if L < Lmin:
                     L = Lmin
                 if L > Lmax:
@@ -1007,6 +1045,7 @@ def main() -> None:
         ray_p /= total_prob  #  概率归一化
         ray_cdf = np.cumsum(ray_p)  # 计算累积分布函数 (CDF)
         ray_cdf[-1] = 1.0
+        update_weight = posterior_entropy_weight(ray_p, w_min=0.2)
 
         d = np.array([float(x_n_all[idx]), float(y_n_all[idx]), 1.0], dtype=np.float64)  # 构建这条射线的方向向量
         nrm = np.linalg.norm(d)  # 计算d的模长
@@ -1028,7 +1067,7 @@ def main() -> None:
         dda_update_dense_cdf(
             Lgrid, origin, d, end_dist, mins, voxel,
             nx, ny, nz, ray_r, ray_cdf, int(ray_r.size),
-            Lmin, Lmax, logit_p0, float(args.p_occ), float(args.p_free),
+            Lmin, Lmax, logit_p0, float(args.p_occ), float(args.p_free), float(update_weight),
             range_model_is_range,
         )
 
