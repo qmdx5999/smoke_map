@@ -888,6 +888,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--fy", type=float, default=None)
     ap.add_argument("--cx", type=float, default=None)
     ap.add_argument("--cy", type=float, default=None)
+    ap.add_argument("--profile", action="store_true", help="Print timing breakdown for major pipeline stages.")
     return ap.parse_args()
 
 
@@ -971,6 +972,16 @@ def main() -> None:
     min_sep = support
 
     surface_points = []  # 初始化表面点云列表
+    profile_enabled = bool(args.profile)
+    t_peak = 0.0
+    t_posterior = 0.0
+    t_merge = 0.0
+    t_surface = 0.0
+    t_dda = 0.0
+    t_output = 0.0
+    rays_with_peaks = 0
+    rays_fused = 0
+    posterior_evals = 0
     t0 = time.time()
     for k, idx in enumerate(rays):  # 遍历每条射线
         h = hist_data[idx]  # 取出它的光子直方图
@@ -978,6 +989,7 @@ def main() -> None:
         # 检测直方图中的所有显著峰值
         # peaks：检测到的峰值位置列表，每个元素是峰值所在的时间 bin 索引
         # peak_scores：对应峰值的置信度分数列表，分数越高表示这个峰越可能是真实的物体反射
+        _tp = time.perf_counter()
         peaks, peak_scores = mp_find_peaks(
             h,
             max_peaks=args.max_peaks,
@@ -986,8 +998,10 @@ def main() -> None:
             support_radius=support,
             min_sep=min_sep,
         )
+        t_peak += time.perf_counter() - _tp
         if len(peaks) == 0:
             continue
+        rays_with_peaks += 1
 
         peak_posteriors_r = []  # 存储每个峰值对应的距离网格数组
         peak_posteriors_p = []  # 存储每个峰值对应的后验概率分布数组，与peak_posteriors_r一一对应
@@ -1000,6 +1014,7 @@ def main() -> None:
         # pk：当前峰值所在的时间 bin 索引;pk_score：当前峰值的匹配追踪分数，分数越高表示这个峰越可能是真实的物体反射，而非噪声
         for pk, pk_score in zip(peaks, peak_scores):
             # r_grid_m：距离数组，每个元素对应一个候选距离 r，单位为米；pdf_grid：距离后验概率密度函数，pdf_grid[i]：表示墙在r_grid_m[i]米处的概率
+            _tp = time.perf_counter()
             r_grid_m, _, pdf_grid = compute_ll_grid_numba(
                 h,
                 int(pk),
@@ -1010,6 +1025,8 @@ def main() -> None:
                 float(args.tau),
                 float(bin_to_m),
             )
+            t_posterior += time.perf_counter() - _tp
+            posterior_evals += 1
             peak_weight = max(float(pk_score), 0.0) / total_peak_score  # 计算当前峰值的权重
             pk_local = int(np.argmax(pdf_grid))  # 返回pdf_grid数组中最大值所在的索引
             peak_depth = float(r_grid_m[pk_local])  # 用刚才找到的概率峰值索引，去距离网格中取出对应的实际距离
@@ -1024,6 +1041,7 @@ def main() -> None:
         if len(peak_posteriors_r) == 0:
             continue
 
+        _tp = time.perf_counter()
         # 如果只检测到一个有效峰值，直接使用这个峰值的距离网格和加权后的概率分布
         if len(peak_posteriors_r) == 1:
             ray_r = np.asarray(peak_posteriors_r[0], dtype=np.float64)
@@ -1046,6 +1064,7 @@ def main() -> None:
         ray_cdf = np.cumsum(ray_p)  # 计算累积分布函数 (CDF)
         ray_cdf[-1] = 1.0
         update_weight = posterior_entropy_weight(ray_p, w_min=0.2)
+        t_merge += time.perf_counter() - _tp
 
         d = np.array([float(x_n_all[idx]), float(y_n_all[idx]), 1.0], dtype=np.float64)  # 构建这条射线的方向向量
         nrm = np.linalg.norm(d)  # 计算d的模长
@@ -1053,6 +1072,7 @@ def main() -> None:
             continue
         d /= nrm  # 归一化得到单位方向向量,代表这条射线在三维空间中的方向向量
 
+        _tp = time.perf_counter()
         for peak_depth, peak_conf in profile_points:
             if peak_depth <= 0.0 or peak_depth > end_dist:
                 continue
@@ -1062,20 +1082,25 @@ def main() -> None:
                 scale = peak_depth / max(d[2], 1e-12)
                 p3 = d * scale
             surface_points.append((float(p3[0]), float(p3[1]), float(p3[2]), float(peak_conf)))  # surface_points列表:带置信度的三维点云
+        t_surface += time.perf_counter() - _tp
 
         # 把当前这一条 ray 的 CDF 后验结果写进 3D occupancy map
+        _tp = time.perf_counter()
         dda_update_dense_cdf(
             Lgrid, origin, d, end_dist, mins, voxel,
             nx, ny, nz, ray_r, ray_cdf, int(ray_r.size),
             Lmin, Lmax, logit_p0, float(args.p_occ), float(args.p_free), float(update_weight),
             range_model_is_range,
         )
+        t_dda += time.perf_counter() - _tp
+        rays_fused += 1
 
         # 每处理 5000 条 ray 打印一次进度
         if (k + 1) % 5000 == 0:
             print("processed rays:", k + 1, "/", rays.size, "elapsed(s)=", round(time.time() - t0, 1))
 
     print("done. elapsed(s)=", round(time.time() - t0, 2))
+    _tp = time.perf_counter()
     write_occ_slice(args.slice_out, Lgrid, args.z_slice, args.z_min, voxel, args.p0)
     if surface_points:
         write_surface_ply(args.surface_out, np.asarray(surface_points, dtype=np.float32))
@@ -1089,9 +1114,23 @@ def main() -> None:
         int(args.max_out),
         float(args.export_min_prob),
     )
+    t_output += time.perf_counter() - _tp
     active_count = int(np.count_nonzero(np.abs(Lgrid) > 1e-6))
     print("active voxels:", active_count)
     print("exported occupied voxels:", occupied_count)
+    if profile_enabled:
+        total_elapsed = max(time.time() - t0, 1e-12)
+        measured = t_peak + t_posterior + t_merge + t_surface + t_dda + t_output
+        other = max(0.0, total_elapsed - measured)
+        print("profile timing breakdown:")
+        print(f"  rays total: {rays.size}, with peaks: {rays_with_peaks}, fused: {rays_fused}, posterior evals: {posterior_evals}")
+        print(f"  peak detection: {t_peak:.3f}s ({100.0 * t_peak / total_elapsed:.1f}%)")
+        print(f"  posterior likelihood: {t_posterior:.3f}s ({100.0 * t_posterior / total_elapsed:.1f}%)")
+        print(f"  posterior merge + entropy: {t_merge:.3f}s ({100.0 * t_merge / total_elapsed:.1f}%)")
+        print(f"  surface points: {t_surface:.3f}s ({100.0 * t_surface / total_elapsed:.1f}%)")
+        print(f"  DDA CDF update: {t_dda:.3f}s ({100.0 * t_dda / total_elapsed:.1f}%)")
+        print(f"  output writing: {t_output:.3f}s ({100.0 * t_output / total_elapsed:.1f}%)")
+        print(f"  other / overhead: {other:.3f}s ({100.0 * other / total_elapsed:.1f}%)")
 
 
 if __name__ == "__main__":
