@@ -11,6 +11,8 @@ import argparse
 import math
 import os
 import time
+from pathlib import Path
+from typing import Dict, List, Tuple
 
 import matplotlib
 matplotlib.use("Agg")
@@ -29,7 +31,6 @@ except Exception:
 C_M_PER_S = 299_792_458.0
 
 DEFAULT_NPZ = "scene_0000.npz"
-DEFAULT_SLICE_OUT = "scene_0000_occ_slice.png"
 DEFAULT_PLY_OUT = "scene_0000_occupied_rgb.ply"
 DEFAULT_SURFACE_OUT = "scene_0000_profile_surface.ply"
 
@@ -439,164 +440,6 @@ def posterior_entropy_weight(pdf: np.ndarray, w_min: float = 0.2) -> float:
 
 
 @njit(cache=True, fastmath=True)
-def dda_update_dense(
-    Lgrid, origin, d, end_dist, mins, voxel,
-    nx, ny, nz, rm_arr, rp_arr, K,
-    Lmin, Lmax, dL_free, dL_occ, range_model_is_range,
-):
-    """
-    沿着一条相机/SPAD ray 穿过 3D voxel grid，把 histogram 推出的距离区间融合成 occupancy log-odds 地图
-    Lgrid:三维对数几率栅格数组，形状为(nx, ny, nz)，存储每个体素的占用概率;origin:相机在世界坐标系中的原点坐标 (x, y, z);d:射线的单位方向向量
-    end_dist:传感器的最大有效测量距离;mins:栅格地图的最小世界坐标 (min_x, min_y, min_z);voxel:体素的边长（单位：米）
-    nx, ny, nz:栅格地图在 x、y、z 三个方向上的体素数量;rm_arr, rp_arr:所有峰值的左右边界数组;K:有效峰值的数量
-    Lmin, Lmax:对数几率的最小值和最大值，防止数值溢出;dL_free:自由空间的对数几率更新量;dL_occ:占用空间的对数几率更新量
-    range_model_is_range:距离模型标志，和之前生成三维点时的参数一致
-
-    输入：
-    一条 ray 的起点 origin
-    一条 ray 的方向 d
-    这条 ray 上可能有物体的距离区间 [rm, rp]
-    当前 3D 地图 Lgrid
-
-    1.把 ray 起点和终点转换成 voxel 坐标
-    2.用 DDA 沿 ray 遍历 voxel
-    3.计算每个 voxel 沿 ray 的距离 rho
-    4.根据 rho 和 occupied intervals 更新 log-odds
-        如果 voxel 在物体前面 rho < rm 则更新为 free：Lgrid[x, y, z] += dL_free
-        如果 voxel 落在物体区间里 rm <= rho <= rp 则更新为 occupied：Lgrid[x, y, z] += dL_occ
-        如果有多个返回峰，中间区域也会更新为 free：第一个物体后面、第二个物体前面 -> free
-        最后一个 occupied interval 后面的空间不更新
-    """
-    # 将相机原点转换为体素坐标
-    v0x = (origin[0] - mins[0]) / voxel
-    v0y = (origin[1] - mins[1]) / voxel
-    v0z = (origin[2] - mins[2]) / voxel
-
-    # 将射线终点转换为体素坐标
-    v1x = (origin[0] + d[0] * end_dist - mins[0]) / voxel
-    v1y = (origin[1] + d[1] * end_dist - mins[1]) / voxel
-    v1z = (origin[2] + d[2] * end_dist - mins[2]) / voxel
-
-    # math.floor函数会向下取整，得到点所在的体素的整数索引
-    x = int(math.floor(v0x))
-    y = int(math.floor(v0y))
-    z = int(math.floor(v0z))
-    x1 = int(math.floor(v1x))
-    y1 = int(math.floor(v1y))
-    z1 = int(math.floor(v1z))
-
-    # 计算射线在体素坐标系中的方向向量
-    dx = v1x - v0x  # 这条 ray 在 grid 的 x 方向一共走了多少个 voxel 单位
-    dy = v1y - v0y
-    dz = v1z - v0z
-
-    # 计算 DDA 步进方向
-    # 如果dx > 0，说明射线在 x 方向上向右移动，每次步进+1;如果dx < 0，说明射线在 x 方向上向左移动，每次步进-1;如果dx = 0，说明射线在 x 方向上不移动，步进0
-    sx = 1 if dx > 0.0 else (-1 if dx < 0.0 else 0)
-    sy = 1 if dy > 0.0 else (-1 if dy < 0.0 else 0)
-    sz = 1 if dz > 0.0 else (-1 if dz < 0.0 else 0)
-
-    if dx == 0.0:  # 说明说明射线在 x 方向完全不动，不会穿过任何 x 边界，设置tMaxX和tDeltaX为无穷大，意思是永远不要优先选择跨 x 边界
-        tMaxX = 1e30
-        tDeltaX = 1e30
-    else:
-        # 如果射线往 x 正方向走，当前 voxel 是 x，下一个 x 边界是 x + 1；如果射线往 x 负方向走，当前 voxel 是 x，下一个 x 边界是 x
-        next_boundary = (x + 1) if sx > 0 else x
-        
-        # 射线ray参数t是射线上的归一化位置参数，在 DDA 里射线可以写成pos(t) = start + t * (end - start)
-        # t = 0表示在射线起点 start；t = 1表示在射线终点 end；t = 0.5表示在起点和终点的正中间；t = 0.25表示走完整条线段的 25%
-        # 所以这里的 t 表示从起点到终点这段 ray，已经走了多少比例
-        # 所以 tMaxX 表示从起点出发，走到第一个 x 边界时，t 等于多少，即沿整条 ray 走百分之多少的长度，就会碰到第一个 x 边界
-        tMaxX = (next_boundary - v0x) / dx
-        
-        # tDeltaX 表示每跨过一个 x voxel 边界，t 要增加多少
-        tDeltaX = 1.0 / abs(dx)
-
-    if dy == 0.0:
-        tMaxY = 1e30
-        tDeltaY = 1e30
-    else:
-        next_boundary = (y + 1) if sy > 0 else y
-        tMaxY = (next_boundary - v0y) / dy
-        tDeltaY = 1.0 / abs(dy)
-
-    if dz == 0.0:
-        tMaxZ = 1e30
-        tDeltaZ = 1e30
-    else:
-        next_boundary = (z + 1) if sz > 0 else z
-        tMaxZ = (next_boundary - v0z) / dz
-        tDeltaZ = 1.0 / abs(dz)
-
-    max_steps = 20000
-    for _ in range(max_steps):
-        # x, y, z 是当前 voxel 的索引，x1, y1, z1 是 ray 终点所在 voxel 的索引，如果当前 voxel 已经是终点 voxel，就停止遍历
-        if x == x1 and y == y1 and z == z1:
-            break
-
-        if 0 <= x < nx and 0 <= y < ny and 0 <= z < nz:
-            # 把 voxel 索引转回真实世界坐标，得到当前 voxel 的中心点坐标，单位是米
-            cx = mins[0] + voxel * (x + 0.5)
-            cy = mins[1] + voxel * (y + 0.5)
-            cz = mins[2] + voxel * (z + 0.5)
-
-            if range_model_is_range:
-                # 点积：rho = d · (voxel_center - origin)，d 是单位方向向量，voxel_center - origin 是从传感器指向当前 voxel center 的向量
-                # 点积的结果就是当前 voxel center 在 ray 方向上的距离，因为 d 已经归一化，所以 rho 的单位是米
-                rho = d[0] * (cx - origin[0]) + d[1] * (cy - origin[1]) + d[2] * (cz - origin[2])
-            else:
-                rho = cz
-
-            if rho > 0.0 and rho <= end_dist and K > 0:
-                for i in range(K):
-                    rm = rm_arr[i]
-                    rp = rp_arr[i]
-                    if rho < rm:
-                        L = Lgrid[x, y, z] + dL_free
-                        if L < Lmin:
-                            L = Lmin
-                        if L > Lmax:
-                            L = Lmax
-                        Lgrid[x, y, z] = L
-                        break
-                    if rho <= rp:
-                        L = Lgrid[x, y, z] + dL_occ
-                        if L < Lmin:
-                            L = Lmin
-                        if L > Lmax:
-                            L = Lmax
-                        Lgrid[x, y, z] = L
-                        break
-                    
-                    # 处理多个 peak / 多个 occupied interval 的情况
-                    if i + 1 < K:
-                        nrm = rm_arr[i + 1]
-                        if rho > rp and rho < nrm:
-                            L = Lgrid[x, y, z] + dL_free
-                            if L < Lmin:
-                                L = Lmin
-                            if L > Lmax:
-                                L = Lmax
-                            Lgrid[x, y, z] = L
-                            break
-
-        if tMaxX < tMaxY:
-            if tMaxX < tMaxZ:
-                x += sx
-                tMaxX += tDeltaX
-            else:
-                z += sz
-                tMaxZ += tDeltaZ
-        else:
-            if tMaxY < tMaxZ:
-                y += sy
-                tMaxY += tDeltaY
-            else:
-                z += sz
-                tMaxZ += tDeltaZ
-
-
-@njit(cache=True, fastmath=True)
 def dda_update_dense_cdf(
     Lgrid, origin, d, end_dist, mins, voxel,
     nx, ny, nz, r_grid_m, cdf_grid, n_hyp,
@@ -752,28 +595,6 @@ def dda_update_dense_cdf(
                 tMaxZ += tDeltaZ
 
 
-def write_occ_slice(path: str, Lgrid: np.ndarray, z_slice: float, z_min: float, voxel: float, p0: float) -> None:
-    out_dir = os.path.dirname(path)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
-
-    nz = Lgrid.shape[2]
-    izs = int(math.floor((z_slice - z_min) / voxel))
-    if not (0 <= izs < nz):
-        print(f"[WARN] z_slice={z_slice} is outside grid; skip slice output")
-        return
-
-    Ls = Lgrid[:, :, izs].astype(np.float64)
-    slice_img = 1.0 / (1.0 + np.exp(-Ls))
-    plt.figure(figsize=(8, 8))
-    plt.imshow(slice_img.T, origin="lower", vmin=0.0, vmax=1.0)
-    plt.title(f"Occupancy slice at z={z_slice:.2f} m")
-    plt.colorbar()
-    plt.savefig(path, dpi=200)
-    plt.close()
-    print("saved", path)
-
-
 def write_occupied_ply(
     path: str,
     Lgrid: np.ndarray,
@@ -834,161 +655,170 @@ def write_surface_ply(path: str, points: np.ndarray) -> None:
     print("saved", path, "N=", points.shape[0])
 
 
-def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--npz", default=DEFAULT_NPZ, help="SPAD .npz path containing spad_hist")
-    ap.add_argument("--slice-out", default=DEFAULT_SLICE_OUT)
-    ap.add_argument("--ply-out", default=DEFAULT_PLY_OUT)
-    ap.add_argument("--surface-out", default=DEFAULT_SURFACE_OUT)
-    ap.add_argument("--tmax-ns", type=float, default=100.0)  # 激光的最大飞行时间，单位：纳秒 (ns)，默认值100ns，最大测距距离15米
-    ap.add_argument("--voxel", type=float, default=0.10)  # 体素大小，单位：米
-    ap.add_argument("--range_max", type=float, default=5.0)  # 局部地图在 x/y 方向的半长，单位：米，地图范围：x∈[-5,5], y∈[-5,5]
-    ap.add_argument("--z_min", type=float, default=0.0)  # 地图 z 方向的最小值，单位：米，一般设为地面高度
-    ap.add_argument("--z_max", type=float, default=5.0)  # 地图 z 方向的最大值，单位：米，一般设为天花板高度
-    
-    # 最大使用的射线数量，0 表示使用所有通过--peak_thr筛选的射线
-    ap.add_argument("--max_rays", type=int, default=0, help="subsample rays, 0=use all candidate rays")
-    ap.add_argument("--peak_thr", type=float, default=5.0)  # 射线筛选阈值，直方图最大值小于这个值的射线会被直接跳过
-    ap.add_argument("--Wr_bin", type=int, default=12)  # 每个峰值周围的局部窗口半宽，单位：bin，只计算这个范围内的距离后验
-    ap.add_argument("--M", type=int, default=81)  # 每个峰值周围采样的距离假设点数量
-    ap.add_argument("--p_occ", type=float, default=0.70)
-    ap.add_argument("--p_free", type=float, default=0.35)
-    ap.add_argument("--p0", type=float, default=0.50)  # 体素初始先验概率
-    ap.add_argument("--Lmin", type=float, default=-5.0)  # 对数几率的最小值，对应概率≈0.007
-    ap.add_argument("--Lmax", type=float, default=5.0)  # 对数几率的最大值，对应概率≈0.993
-    ap.add_argument("--z_slice", type=float, default=2.0)
-    ap.add_argument("--tau", type=float, default=1.0)
-    ap.add_argument("--win_half", type=int, default=25)  # 直方图截取半宽，单位：bin，计算似然时只截取峰值周围这么大的窗口，必须大于--Wr_bin
-    ap.add_argument("--sigma_bins", type=float, default=2.0)  # 高斯 IRF 的标准差，单位：bin
-    
-    # 距离计算模型："z"：仅用 z 坐标作为距离（2.5D 俯视模式）；"range"：标准 3D 射线距离
-    # 俯视场景（比如无人机）用 "z"，普通 3D 场景（比如地面机器人）必须改成 "range"
-    ap.add_argument("--range_model", choices=["range", "z"], default="range")
-    ap.add_argument("--max_peaks", type=int, default=2)  # 每条射线最多检测多少个峰
-    
-    # 匹配追踪 (MP) 峰值检测阈值，卷积响应小于这个值的峰不会被检测到，控制峰值检测的灵敏度
-    # 调大：只检测明显的峰，减少假阳性；调小：检测更多弱峰，可能引入噪声
-    ap.add_argument("--mp_thr", type=float, default=5.0)
-    
-    # 峰值支持半径，单位：bin，0 表示自动设为 4×--sigma_bins，检测到一个峰后，会把这个半径内的直方图置零
-    ap.add_argument("--mp_support", type=int, default=0, help="support radius in bins, 0=auto(4*sigma)")
-    ap.add_argument("--occ_wmax_vox", type=float, default=2.5)  # 旧 interval update（区间更新）参数；CDF 更新不再使用
-    
-    # 导出占据体素的最小概率阈值，只有概率大于等于这个值的体素才会被导出
-    ap.add_argument(
-        "--export-min-prob",
-        type=float,
-        default=0.55,
-        help="Only export voxels with occupancy probability at least this value.",
-    )
-    ap.add_argument("--max_out", type=int, default=0)  # 导出 PLY 点云的最大点数，0 表示不限制，当体素太多时，限制点数防止文件过大
-    
-    # 如果相机不是 NYU 标准内参，就手动指定
-    ap.add_argument("--fx", type=float, default=None)
-    ap.add_argument("--fy", type=float, default=None)
-    ap.add_argument("--cx", type=float, default=None)
-    ap.add_argument("--cy", type=float, default=None)
-    ap.add_argument("--profile", action="store_true", help="Print timing breakdown for major pipeline stages.")
-    return ap.parse_args()
-
-
-def main() -> None:
-    args = parse_args()
-
-    print("loading npz ...")
-    data = np.load(args.npz)
-    if "spad_hist" not in data:
-        raise KeyError(f"{args.npz} does not contain a 'spad_hist' array")
-    spad_hist = np.asarray(data["spad_hist"])
+def load_spad_hist_npz(path: Path) -> np.ndarray:
+    """输入：单个.npz 文件的路径;输出：形状为(H, W, T)的三维 numpy 数组，存储该帧的 SPAD 直方图数据"""
+    with np.load(path) as data:
+        if "spad_hist" not in data:
+            raise KeyError(f"{path} does not contain a 'spad_hist' array")
+        spad_hist = np.asarray(data["spad_hist"])
     if spad_hist.ndim != 3:
-        raise ValueError(f"spad_hist must have shape (H, W, T), got {spad_hist.shape}")
+        raise ValueError(f"{path}: spad_hist must have shape (H, W, T), got {spad_hist.shape}")
+    return spad_hist
 
+
+def discover_npz_frames(npz_dir: str, max_frames: int) -> List[Path]:
+    """输出按文件名升序排列的.npz 文件路径列表"""
+    root = Path(npz_dir)
+    if not root.is_dir():
+        raise NotADirectoryError(root)
+    frames = sorted(root.glob("*.npz"), key=lambda p: p.name)
+    if not frames:
+        raise FileNotFoundError(f"No .npz files found in {root}")
+    if max_frames > 0:
+        frames = frames[:max_frames]
+    return frames
+
+
+def load_poses_txt(path: str) -> Dict[str, np.ndarray]:
+    """输入一个位姿文本文件，输出一个{帧名: 4x4 T_wc矩阵}的字典"""
+    pose_path = Path(path)
+    if not pose_path.is_file():
+        raise FileNotFoundError(pose_path)
+
+    poses: Dict[str, np.ndarray] = {}
+    with open(pose_path, "r", encoding="utf-8") as f:
+        for line_no, raw in enumerate(f, start=1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) != 17:
+                raise ValueError(
+                    f"{pose_path}:{line_no}: expected frame_key plus 16 matrix values, got {len(parts)} fields"
+                )
+            key = parts[0]
+            if key in poses:
+                raise ValueError(f"{pose_path}:{line_no}: duplicate pose key {key!r}")
+            try:
+                values = [float(v) for v in parts[1:]]
+            except ValueError as exc:
+                raise ValueError(f"{pose_path}:{line_no}: non-numeric matrix value") from exc
+            T_wc = np.asarray(values, dtype=np.float64).reshape(4, 4)
+            if not np.all(np.isfinite(T_wc)):
+                raise ValueError(f"{pose_path}:{line_no}: matrix contains non-finite values")
+            poses[key] = T_wc
+
+    if not poses:
+        raise ValueError(f"{pose_path} does not contain any poses")
+    return poses
+
+
+def resolve_map_bounds(args: argparse.Namespace, multi_frame: bool) -> Tuple[np.ndarray, np.ndarray]:
+    """确定整个三维占用栅格地图在世界坐标系中的空间边界"""
+    # 收集手动边界参数
+    explicit = [
+        args.map_min_x, args.map_max_x,
+        args.map_min_y, args.map_max_y,
+        args.map_min_z, args.map_max_z,
+    ]
+    # 如果用户没有指定任何手动边界参数，进入自动边界模式
+    if all(v is None for v in explicit):
+        mins = np.array([-args.range_max, -args.range_max, args.z_min], dtype=np.float64)
+        maxs = np.array([args.range_max, args.range_max, args.z_max], dtype=np.float64)
+        return mins, maxs
+    if any(v is None for v in explicit):
+        mode = "multi-frame" if multi_frame else "single-frame"
+        raise ValueError(f"{mode}: specify all six map bound arguments or none")
+
+    # 如果用户指定了全部六个参数，直接使用这些值作为地图边界
+    mins = np.array([args.map_min_x, args.map_min_y, args.map_min_z], dtype=np.float64)
+    maxs = np.array([args.map_max_x, args.map_max_y, args.map_max_z], dtype=np.float64)
+    if not np.all(np.isfinite(mins)) or not np.all(np.isfinite(maxs)):
+        raise ValueError("map bounds must be finite")
+    if np.any(maxs <= mins):
+        raise ValueError(f"invalid map bounds: mins={mins}, maxs={maxs}")
+    return mins, maxs
+
+
+def process_frame(
+    frame_key: str,
+    spad_hist: np.ndarray,
+    T_wc: np.ndarray,
+    Lgrid: np.ndarray,
+    mins: np.ndarray,
+    voxel: float,
+    args: argparse.Namespace,
+) -> Tuple[List[Tuple[float, float, float, float]], Dict[str, float]]:
     H, W, B = spad_hist.shape
     hist_data = spad_hist.reshape(H * W, B).astype(np.float64)
     bin_to_m = C_M_PER_S * (args.tmax_ns * 1e-9) / 2.0 / float(B)
-    print(f"spad_hist shape={spad_hist.shape}, dtype={spad_hist.dtype}")
-    print(f"bin_to_m={bin_to_m:.8f} m/bin, tmax={args.tmax_ns:g} ns")
+    print(f"[{frame_key}] spad_hist shape={spad_hist.shape}, dtype={spad_hist.dtype}")
+    print(f"[{frame_key}] bin_to_m={bin_to_m:.8f} m/bin, tmax={args.tmax_ns:g} ns")
 
     default_fx, default_fy, default_cx, default_cy = scaled_nyu_intrinsics(W, H)
     fx = default_fx if args.fx is None else args.fx
     fy = default_fy if args.fy is None else args.fy
     cx = default_cx if args.cx is None else args.cx
     cy = default_cy if args.cy is None else args.cy
-    print(f"intrinsics fx={fx:.4f}, fy={fy:.4f}, cx={cx:.4f}, cy={cy:.4f}")
+    print(f"[{frame_key}] intrinsics fx={fx:.4f}, fy={fy:.4f}, cx={cx:.4f}, cy={cy:.4f}")
 
-    # 生成两个和图像一样大的表格，一个表格里全是像素的列号，另一个表格里全是像素的行号
     u_grid, v_grid = np.meshgrid(np.arange(W, dtype=np.float64), np.arange(H, dtype=np.float64))
-    
-    # 从像素坐标到归一化图像坐标的转换，是针孔相机模型的核心公式
-    # 平移：将坐标原点从图像左上角（像素坐标的原点）移动到图像中心（主点）
-    # 缩放：将像素单位转换为归一化单位
     x_n_all = ((u_grid.reshape(-1) - cx) / fx).astype(np.float64)
     y_n_all = ((v_grid.reshape(-1) - cy) / fy).astype(np.float64)
 
-    voxel = float(args.voxel)
-    
-    # 定义地图的边界
-    mins = np.array([-args.range_max, -args.range_max, args.z_min], dtype=np.float64)
-    maxs = np.array([args.range_max, args.range_max, args.z_max], dtype=np.float64)
-    
-    # 计算每个方向的体素数量，maxs - mins计算每个方向的总长度，除以体素大小，得到每个方向需要多少个体素，np.ceil()向上取整，保证整个场景都被网格覆盖
-    dims = np.ceil((maxs - mins) / voxel).astype(np.int64)
-    nx, ny, nz = int(dims[0]), int(dims[1]), int(dims[2])
-    print("grid dims =", (nx, ny, nz), "voxel =", voxel)
-    
-    # 初始化对数几率网格，这就是全局 3D 占据地图，是整个算法的最终输出，每个元素对应一个体素的对数几率值，初始化为 0，对应概率 p=0.5，
-    # 表示所有体素初始状态都是完全不确定的
-    Lgrid = np.zeros((nx, ny, nz), dtype=np.float32)
+    # T_wc：相机坐标系 → 世界坐标系的齐次变换矩阵
+    if T_wc.shape != (4, 4):
+        raise ValueError(f"{frame_key}: T_wc must have shape (4, 4), got {T_wc.shape}")
+    # R_wc：3x3 旋转矩阵，描述相机的朝向,正交矩阵，将相机坐标系下的方向向量，旋转到世界坐标系下
+    R_wc = np.asarray(T_wc[:3, :3], dtype=np.float64)
+    # origin_w：3x1 平移向量，描述相机在世界坐标系中的位置,也就是这一帧相机光心的三维坐标
+    origin_w = np.asarray(T_wc[:3, 3], dtype=np.float64)
 
     mx = hist_data.max(axis=1)
-    cand = np.where(mx >= args.peak_thr)[0]  # 候选射线列表，里面的每个数字都是原始数据中对应射线的索引
-    print("candidate rays:", cand.size)
+    cand = np.where(mx >= args.peak_thr)[0]
+    print(f"[{frame_key}] candidate rays: {cand.size}")
     if cand.size == 0:
-        print("No rays pass threshold.")
-        return
+        return [], {
+            "rays_total": 0.0,
+            "rays_with_peaks": 0.0,
+            "rays_fused": 0.0,
+            "posterior_evals": 0.0,
+            "t_peak": 0.0,
+            "t_posterior": 0.0,
+            "t_merge": 0.0,
+            "t_surface": 0.0,
+            "t_dda": 0.0,
+        }
+
     if args.max_rays > 0 and cand.size > args.max_rays:
         sel = np.linspace(0, cand.size - 1, args.max_rays).astype(np.int64)
-        rays = cand[sel]  # 均匀子采样
+        rays = cand[sel]
     else:
         rays = cand
-    # 最终得到的rays列表，就是后面要进入核心循环处理的所有射线
-    print("using rays:", rays.size)
+    print(f"[{frame_key}] using rays: {rays.size}")
 
-    origin = np.zeros(3, dtype=np.float64)  # 激光雷达在局部地图坐标系中的位置，设为 (0,0,0)
-    end_dist = float(args.range_max)  # 每条射线的最大遍历距离，单位：米
+    end_dist = float(args.range_max)
     range_model_is_range = args.range_model == "range"
-    
-    # CDF update（累积分布函数更新）使用完整后验概率计算每个 voxel（体素）的单次观测概率
     logit_p0 = float(logit(args.p0))
-    
-    # 对数几率的上下限
     Lmin = float(args.Lmin)
     Lmax = float(args.Lmax)
-    
-    # 峰值检测的支持半径，单位：bin，检测到一个峰后，会把这个峰周围support个 bin 范围内的直方图全部置零，避免重复检测同一个峰
+    nx, ny, nz = Lgrid.shape
     support = int(args.mp_support) if args.mp_support > 0 else int(np.ceil(4.0 * args.sigma_bins))
-    
-    # 两个峰值之间的最小距离，单位：bin，如果新检测到的峰和已经检测到的峰之间的距离小于min_sep，就认为是同一个峰，直接丢弃
     min_sep = support
 
-    surface_points = []  # 初始化表面点云列表
-    profile_enabled = bool(args.profile)
+    surface_points: List[Tuple[float, float, float, float]] = []
     t_peak = 0.0
     t_posterior = 0.0
     t_merge = 0.0
     t_surface = 0.0
     t_dda = 0.0
-    t_output = 0.0
     rays_with_peaks = 0
     rays_fused = 0
     posterior_evals = 0
-    t0 = time.time()
-    for k, idx in enumerate(rays):  # 遍历每条射线
-        h = hist_data[idx]  # 取出它的光子直方图
-        
-        # 检测直方图中的所有显著峰值
-        # peaks：检测到的峰值位置列表，每个元素是峰值所在的时间 bin 索引
-        # peak_scores：对应峰值的置信度分数列表，分数越高表示这个峰越可能是真实的物体反射
+    frame_t0 = time.time()
+
+    for k, idx in enumerate(rays):
+        h = hist_data[idx]
         _tp = time.perf_counter()
         peaks, peak_scores = mp_find_peaks(
             h,
@@ -1003,56 +833,47 @@ def main() -> None:
             continue
         rays_with_peaks += 1
 
-        peak_posteriors_r = []  # 存储每个峰值对应的距离网格数组
-        peak_posteriors_p = []  # 存储每个峰值对应的后验概率分布数组，与peak_posteriors_r一一对应
-        profile_points = []  # 存储这条射线所有的表面点信息，每个元素是一个元组(peak_depth, peak_conf)，表示在peak_depth米处有一个表面点，置信度为peak_conf
-
-        total_peak_score = float(sum(max(float(s), 0.0) for s in peak_scores))  # 计算总分数
+        peak_posteriors_r = []
+        peak_posteriors_p = []
+        profile_points = []
+        total_peak_score = float(sum(max(float(s), 0.0) for s in peak_scores))
         if total_peak_score <= 0.0:
-            total_peak_score = float(len(peaks))  # 如果总分数为 0，就用峰值的数量代替总分数，这样每个峰值的权重就相等
+            total_peak_score = float(len(peaks))
 
-        # pk：当前峰值所在的时间 bin 索引;pk_score：当前峰值的匹配追踪分数，分数越高表示这个峰越可能是真实的物体反射，而非噪声
         for pk, pk_score in zip(peaks, peak_scores):
-            # r_grid_m：距离数组，每个元素对应一个候选距离 r，单位为米；pdf_grid：距离后验概率密度函数，pdf_grid[i]：表示墙在r_grid_m[i]米处的概率
             _tp = time.perf_counter()
             r_grid_m, _, pdf_grid = compute_ll_grid_numba(
                 h,
                 int(pk),
-                int(args.Wr_bin),  # 峰值周围的局部窗口半宽，单位 bin，默认值为12
-                int(args.M),  # 采样点数，默认值为81，在 ±12 个 bin 的范围内采样 81 个点，也就是每个 bin 采样约 3.4 个点
-                int(args.win_half),  # 直方图截取半宽，单位 bin，默认值为25，计算似然时只截取峰值周围 ±25 个 bin 的直方图
+                int(args.Wr_bin),
+                int(args.M),
+                int(args.win_half),
                 float(args.sigma_bins),
                 float(args.tau),
                 float(bin_to_m),
             )
             t_posterior += time.perf_counter() - _tp
             posterior_evals += 1
-            peak_weight = max(float(pk_score), 0.0) / total_peak_score  # 计算当前峰值的权重
-            pk_local = int(np.argmax(pdf_grid))  # 返回pdf_grid数组中最大值所在的索引
-            peak_depth = float(r_grid_m[pk_local])  # 用刚才找到的概率峰值索引，去距离网格中取出对应的实际距离
-            peak_conf = float(pdf_grid[pk_local])  # 取出概率峰值处的概率值
+            peak_weight = max(float(pk_score), 0.0) / total_peak_score
+            pk_local = int(np.argmax(pdf_grid))
+            peak_depth = float(r_grid_m[pk_local])
+            peak_conf = float(pdf_grid[pk_local])
             if peak_depth <= 0.0 or peak_depth > end_dist:
                 continue
-
-            peak_posteriors_r.append(r_grid_m)  # 将当前峰值的距离网格存入列表
-            peak_posteriors_p.append(pdf_grid * peak_weight)  # 将当前峰值的后验概率分布乘以权重后存入列表。这一步实现了按置信度加权
-            profile_points.append((peak_depth, peak_conf))  # 将当前峰值对应的表面点存入列表，后续会导出为 PLY 文件
+            peak_posteriors_r.append(r_grid_m)
+            peak_posteriors_p.append(pdf_grid * peak_weight)
+            profile_points.append((peak_depth, peak_conf))
 
         if len(peak_posteriors_r) == 0:
             continue
 
         _tp = time.perf_counter()
-        # 如果只检测到一个有效峰值，直接使用这个峰值的距离网格和加权后的概率分布
         if len(peak_posteriors_r) == 1:
             ray_r = np.asarray(peak_posteriors_r[0], dtype=np.float64)
             ray_p = np.asarray(peak_posteriors_p[0], dtype=np.float64)
         else:
-            # 拼接所有峰值的后验数组,np.concatenate将所有峰值的距离网格和加权后的概率分布分别拼接成两个一维数组
-            # 例如：如果检测到 2 个峰值，每个峰值有 81 个采样点，那么拼接后的ray_r和ray_p的长度都是 162
             ray_r = np.concatenate([np.asarray(arr, dtype=np.float64) for arr in peak_posteriors_r])
             ray_p = np.concatenate([np.asarray(arr, dtype=np.float64) for arr in peak_posteriors_p])
-            
-            # 按距离升序排序
             order = np.argsort(ray_r)
             ray_r = ray_r[order]
             ray_p = ray_p[order]
@@ -1060,34 +881,44 @@ def main() -> None:
         total_prob = float(ray_p.sum())
         if total_prob <= 0.0:
             continue
-        ray_p /= total_prob  #  概率归一化
-        ray_cdf = np.cumsum(ray_p)  # 计算累积分布函数 (CDF)
+        ray_p /= total_prob
+        ray_cdf = np.cumsum(ray_p)
         ray_cdf[-1] = 1.0
         update_weight = posterior_entropy_weight(ray_p, w_min=0.2)
         t_merge += time.perf_counter() - _tp
 
-        d = np.array([float(x_n_all[idx]), float(y_n_all[idx]), 1.0], dtype=np.float64)  # 构建这条射线的方向向量
-        nrm = np.linalg.norm(d)  # 计算d的模长
+        # 生成相机坐标系下的原始方向向量
+        d_cam = np.array([float(x_n_all[idx]), float(y_n_all[idx]), 1.0], dtype=np.float64)
+        # 归一化为单位向量:计算方向向量的模长,将方向向量除以模长，得到单位方向向量
+        nrm = np.linalg.norm(d_cam)
         if nrm <= 1e-12:
             continue
-        d /= nrm  # 归一化得到单位方向向量,代表这条射线在三维空间中的方向向量
+        d_cam /= nrm
+        # 旋转方向向量:@是 Python 中的矩阵乘法运算符,用旋转矩阵R_wc乘以相机坐标系下的方向向量d_cam，得到世界坐标系下的方向向量d_w
+        d_w = R_wc @ d_cam
+        # 再次归一化
+        nrm_w = np.linalg.norm(d_w)
+        if nrm_w <= 1e-12:
+            continue
+        d_w = np.asarray(d_w / nrm_w, dtype=np.float64)
 
         _tp = time.perf_counter()
         for peak_depth, peak_conf in profile_points:
             if peak_depth <= 0.0 or peak_depth > end_dist:
                 continue
             if range_model_is_range:
-                p3 = d * peak_depth  # 三维点坐标 = 单位方向向量 × 直线距离
+                # p3:这个表面点在世界坐标系中的三维坐标;origin_w:相机光心在世界坐标系中的三维坐标
+                # d_w:世界坐标系下的从相机指向这个点的单位方向向量;peak_depth:这个点到相机光心的直线距离
+                p3 = origin_w + d_w * peak_depth
             else:
-                scale = peak_depth / max(d[2], 1e-12)
-                p3 = d * scale
-            surface_points.append((float(p3[0]), float(p3[1]), float(p3[2]), float(peak_conf)))  # surface_points列表:带置信度的三维点云
+                scale = peak_depth / max(d_w[2], 1e-12)
+                p3 = origin_w + d_w * scale
+            surface_points.append((float(p3[0]), float(p3[1]), float(p3[2]), float(peak_conf)))
         t_surface += time.perf_counter() - _tp
 
-        # 把当前这一条 ray 的 CDF 后验结果写进 3D occupancy map
         _tp = time.perf_counter()
         dda_update_dense_cdf(
-            Lgrid, origin, d, end_dist, mins, voxel,
+            Lgrid, origin_w, d_w, end_dist, mins, voxel,
             nx, ny, nz, ray_r, ray_cdf, int(ray_r.size),
             Lmin, Lmax, logit_p0, float(args.p_occ), float(args.p_free), float(update_weight),
             range_model_is_range,
@@ -1095,15 +926,144 @@ def main() -> None:
         t_dda += time.perf_counter() - _tp
         rays_fused += 1
 
-        # 每处理 5000 条 ray 打印一次进度
         if (k + 1) % 5000 == 0:
-            print("processed rays:", k + 1, "/", rays.size, "elapsed(s)=", round(time.time() - t0, 1))
+            elapsed = round(time.time() - frame_t0, 1)
+            print(f"[{frame_key}] processed rays: {k + 1} / {rays.size} elapsed(s)= {elapsed}")
 
-    print("done. elapsed(s)=", round(time.time() - t0, 2))
+    print(f"[{frame_key}] done. elapsed(s)= {round(time.time() - frame_t0, 2)}")
+    
+    return surface_points, {
+        "rays_total": float(rays.size),
+        "rays_with_peaks": float(rays_with_peaks),
+        "rays_fused": float(rays_fused),
+        "posterior_evals": float(posterior_evals),
+        "t_peak": t_peak,
+        "t_posterior": t_posterior,
+        "t_merge": t_merge,
+        "t_surface": t_surface,
+        "t_dda": t_dda,
+    }
+
+
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--npz", default=DEFAULT_NPZ, help="Single SPAD .npz path containing spad_hist")
+    ap.add_argument("--npz-dir", "--npz_dir", default=None, help="Directory of per-frame .npz files containing spad_hist")
+    ap.add_argument("--poses", default=None, help="Text file with frame_key followed by 16 camera-to-world matrix values")
+    ap.add_argument("--max-frames", "--max_frames", type=int, default=0, help="Limit multi-frame processing, 0=all")
+    ap.add_argument("--ply-out", default=DEFAULT_PLY_OUT)
+    ap.add_argument("--surface-out", default=DEFAULT_SURFACE_OUT)
+    ap.add_argument("--tmax-ns", type=float, default=100.0)
+    ap.add_argument("--voxel", type=float, default=0.10)
+    ap.add_argument("--range_max", type=float, default=5.0)
+    ap.add_argument("--z_min", type=float, default=0.0)
+    ap.add_argument("--z_max", type=float, default=5.0)
+    ap.add_argument("--map-min-x", type=float, default=None)
+    ap.add_argument("--map-max-x", type=float, default=None)
+    ap.add_argument("--map-min-y", type=float, default=None)
+    ap.add_argument("--map-max-y", type=float, default=None)
+    ap.add_argument("--map-min-z", type=float, default=None)
+    ap.add_argument("--map-max-z", type=float, default=None)
+    ap.add_argument("--max_rays", type=int, default=0, help="subsample rays per frame, 0=all candidate rays")
+    ap.add_argument("--peak_thr", type=float, default=5.0)
+    ap.add_argument("--Wr_bin", type=int, default=12)
+    ap.add_argument("--M", type=int, default=81)
+    ap.add_argument("--p_occ", type=float, default=0.70)
+    ap.add_argument("--p_free", type=float, default=0.35)
+    ap.add_argument("--p0", type=float, default=0.50)
+    ap.add_argument("--Lmin", type=float, default=-5.0)
+    ap.add_argument("--Lmax", type=float, default=5.0)
+    ap.add_argument("--tau", type=float, default=1.0)
+    ap.add_argument("--win_half", type=int, default=25)
+    ap.add_argument("--sigma_bins", type=float, default=2.0)
+    ap.add_argument("--range_model", choices=["range", "z"], default="range")
+    ap.add_argument("--max_peaks", type=int, default=2)
+    ap.add_argument("--mp_thr", type=float, default=5.0)
+    ap.add_argument("--mp_support", type=int, default=0, help="support radius in bins, 0=auto(4*sigma)")
+    ap.add_argument("--export-min-prob", type=float, default=0.55)
+    ap.add_argument("--max_out", type=int, default=0)
+    ap.add_argument("--fx", type=float, default=None)
+    ap.add_argument("--fy", type=float, default=None)
+    ap.add_argument("--cx", type=float, default=None)
+    ap.add_argument("--cy", type=float, default=None)
+    ap.add_argument("--profile", action="store_true", help="Print timing breakdown for major pipeline stages.")
+    return ap.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    multi_frame = args.npz_dir is not None
+    if multi_frame and args.poses is None:
+        raise ValueError("--poses is required when using --npz-dir")
+
+    if multi_frame:
+        frames = discover_npz_frames(args.npz_dir, int(args.max_frames))
+        poses = load_poses_txt(args.poses)
+        missing = [p.stem for p in frames if p.stem not in poses]
+        if missing:
+            preview = ", ".join(missing[:5])
+            suffix = " ..." if len(missing) > 5 else ""
+            raise KeyError(f"poses file is missing {len(missing)} frame keys: {preview}{suffix}")
+        print(f"multi-frame mode: {len(frames)} frames from {args.npz_dir}")
+    else:
+        frames = [Path(args.npz)]
+        poses = {frames[0].stem: np.eye(4, dtype=np.float64)}
+        print("single-frame mode")
+
+    voxel = float(args.voxel)
+    # 得到地图边界
+    mins, maxs = resolve_map_bounds(args, multi_frame)
+    # maxs - mins：计算 x、y、z 三个方向的总长度,除以体素边长得到每个方向需要的体素数量
+    dims = np.ceil((maxs - mins) / voxel).astype(np.int64)
+    nx, ny, nz = int(dims[0]), int(dims[1]), int(dims[2])
+    print("grid mins =", mins, "maxs =", maxs)
+    print("grid dims =", (nx, ny, nz), "voxel =", voxel)
+    # 创建一个三维数组Lgrid，形状为(nx, ny, nz)，每个元素对应一个体素,初始值全为 0，对应先验占用概率 0.5
+    Lgrid = np.zeros((nx, ny, nz), dtype=np.float32)
+
+    # 收集所有帧检测到的表面点云，每个元素是一个包含 4 个浮点数的元组：(x, y, z, conf)
+    all_surface_points: List[Tuple[float, float, float, float]] = []
+    # 用来累计统计整个多帧处理过程的各项性能指标
+    # rays_total:所有帧总共处理的射线数量;rays_with_peaks:所有帧中检测到有效峰值的射线数量;rays_fused:所有帧中成功融合到地图中的射线数量
+    # posterior_evals:所有帧中总共计算的距离后验次数;t_peak:所有帧中峰值检测阶段的总耗时;t_posterior:所有帧中后验似然计算阶段的总耗时
+    # t_merge:所有帧中后验合并与熵计算阶段的总耗时;t_surface:所有帧中表面点生成阶段的总耗时;t_dda:所有帧中 DDA 地图更新阶段的总耗时
+    # 所有帧处理完成后，如果开启了--profile参数，这些统计值会被打印出来，方便分析性能瓶颈
+    totals = {
+        "rays_total": 0.0,
+        "rays_with_peaks": 0.0,
+        "rays_fused": 0.0,
+        "posterior_evals": 0.0,
+        "t_peak": 0.0,
+        "t_posterior": 0.0,
+        "t_merge": 0.0,
+        "t_surface": 0.0,
+        "t_dda": 0.0,
+    }
+    t0 = time.time()
+
+    for frame_i, frame_path in enumerate(frames, start=1):
+        # 取出当前帧文件的文件名，就是去掉.npz后缀，也就是帧名，这个帧名会用来从poses字典中查找对应的相机位姿矩阵
+        frame_key = frame_path.stem
+        print(f"loading frame {frame_i}/{len(frames)}: {frame_path}")
+        # 加载当前帧的 SPAD 直方图数据，返回值spad_hist是一个三维 numpy 数组，形状为(H, W, T)
+        spad_hist = load_spad_hist_npz(frame_path)
+        surface_points, stats = process_frame(
+            frame_key,
+            spad_hist,
+            poses[frame_key],
+            Lgrid,
+            mins,
+            voxel,
+            args,
+        )
+        all_surface_points.extend(surface_points)
+        for key in totals:
+            totals[key] += float(stats.get(key, 0.0))
+
+    print("all frames done. elapsed(s)=", round(time.time() - t0, 2))
     _tp = time.perf_counter()
-    write_occ_slice(args.slice_out, Lgrid, args.z_slice, args.z_min, voxel, args.p0)
-    if surface_points:
-        write_surface_ply(args.surface_out, np.asarray(surface_points, dtype=np.float32))
+    if all_surface_points:
+        write_surface_ply(args.surface_out, np.asarray(all_surface_points, dtype=np.float32))
     else:
         write_surface_ply(args.surface_out, np.empty((0, 4), dtype=np.float32))
     occupied_count = write_occupied_ply(
@@ -1114,21 +1074,29 @@ def main() -> None:
         int(args.max_out),
         float(args.export_min_prob),
     )
-    t_output += time.perf_counter() - _tp
+    t_output = time.perf_counter() - _tp
     active_count = int(np.count_nonzero(np.abs(Lgrid) > 1e-6))
     print("active voxels:", active_count)
     print("exported occupied voxels:", occupied_count)
-    if profile_enabled:
+
+    if bool(args.profile):
         total_elapsed = max(time.time() - t0, 1e-12)
-        measured = t_peak + t_posterior + t_merge + t_surface + t_dda + t_output
+        measured = (
+            totals["t_peak"] + totals["t_posterior"] + totals["t_merge"]
+            + totals["t_surface"] + totals["t_dda"] + t_output
+        )
         other = max(0.0, total_elapsed - measured)
         print("profile timing breakdown:")
-        print(f"  rays total: {rays.size}, with peaks: {rays_with_peaks}, fused: {rays_fused}, posterior evals: {posterior_evals}")
-        print(f"  peak detection: {t_peak:.3f}s ({100.0 * t_peak / total_elapsed:.1f}%)")
-        print(f"  posterior likelihood: {t_posterior:.3f}s ({100.0 * t_posterior / total_elapsed:.1f}%)")
-        print(f"  posterior merge + entropy: {t_merge:.3f}s ({100.0 * t_merge / total_elapsed:.1f}%)")
-        print(f"  surface points: {t_surface:.3f}s ({100.0 * t_surface / total_elapsed:.1f}%)")
-        print(f"  DDA CDF update: {t_dda:.3f}s ({100.0 * t_dda / total_elapsed:.1f}%)")
+        print(
+            f"  frames: {len(frames)}, rays total: {int(totals['rays_total'])}, "
+            f"with peaks: {int(totals['rays_with_peaks'])}, fused: {int(totals['rays_fused'])}, "
+            f"posterior evals: {int(totals['posterior_evals'])}"
+        )
+        print(f"  peak detection: {totals['t_peak']:.3f}s ({100.0 * totals['t_peak'] / total_elapsed:.1f}%)")
+        print(f"  posterior likelihood: {totals['t_posterior']:.3f}s ({100.0 * totals['t_posterior'] / total_elapsed:.1f}%)")
+        print(f"  posterior merge + entropy: {totals['t_merge']:.3f}s ({100.0 * totals['t_merge'] / total_elapsed:.1f}%)")
+        print(f"  surface points: {totals['t_surface']:.3f}s ({100.0 * totals['t_surface'] / total_elapsed:.1f}%)")
+        print(f"  DDA CDF update: {totals['t_dda']:.3f}s ({100.0 * totals['t_dda'] / total_elapsed:.1f}%)")
         print(f"  output writing: {t_output:.3f}s ({100.0 * t_output / total_elapsed:.1f}%)")
         print(f"  other / overhead: {other:.3f}s ({100.0 * other / total_elapsed:.1f}%)")
 
