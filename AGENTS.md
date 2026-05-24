@@ -1,69 +1,57 @@
-# 回答语言偏好
+# 回答与操作偏好
 
-后续回答中，如果必须使用英文术语、英文变量名或英文论文/代码概念，应尽量在英文后面跟中文括号释义，例如 `posterior（后验概率）`、`occupancy grid（占据栅格）`、`profile likelihood（剖面似然）`。代码原文、命令、文件名、函数名和不可翻译的标识符可以保持原样，但解释性文字中应优先补充中文释义。
+后续回答中，如果必须使用英文术语、英文变量名或英文论文/代码概念，应尽量在英文后面跟中文括号释义，例如 `posterior（后验概率）`、`occupancy grid（占据栅格）`、`profile likelihood（剖面似然）`。代码原文、命令、文件名、函数名和不可翻译的标识符可以保持原样。
 
-# 项目接手说明
+禁止批量删除文件或目录。不要使用 `del /s`、`rd /s`、`rmdir /s`、`Remove-Item -Recurse`、`rm -rf`。如果需要删除文件，只能一次删除一个明确路径的文件；如果需要批量删除，应停止操作并让用户手动处理。
 
-本文档记录当前文件夹 `D:\pythonProgram\smoke_map` 中已经能判断出的项目信息，方便后续继续接手、整理和扩展。
+# 当前项目状态
 
-## 项目整体目标
+当前目录 `D:\pythonProgram\smoke_map` 是一个围绕 Single-Photon LiDAR / SPAD / TCSPC photon histogram（光子到达直方图）做三维占据建图的研究原型。核心目标是避免先把 histogram 压成单一 depth（深度）或 point cloud（点云），而是把 histogram-level uncertainty（直方图级不确定性）直接传进 occupancy mapping（占据建图）。
 
-这个项目围绕 **Single-Photon LiDAR / SPAD / TCSPC photon histogram** 数据做三维建图。
-
-核心研究问题是：单光子 LiDAR 每个像素拿到的不是一个确定深度，而是一条 photon arrival histogram。传统做法通常直接取最大峰值，把 histogram 转成 depth image 或 point cloud，再做建图；但这种做法会丢掉 histogram 中的噪声、不确定性和多峰信息。
-
-当前论文和代码的主要思路是：
-
-```text
-raw photon histogram
-  -> Poisson/profile likelihood range inference
-  -> range posterior / 多峰距离假设
-  -> uncertainty-aware occupancy grid update
-  -> 3D occupancy map
-```
-
-也就是说，项目真正想做的不是普通点云重建，而是 **直接把 photon histogram 级别的不确定性传递到 occupancy mapping 中**。
-
-## 当前目录结构
+当前主要文件与目录：
 
 ```text
 .
 ├── AGENTS.md
-├── test_mapping_profile_3d_pdfalign_fast_v3.py
+├── spad_npz_occupancy_mapping.py
+├── spad_npz_to_ply.py
+├── generate_spad_data.py
+├── generate_spad_data_icl.py
 ├── raw2pc_undistortPoints.py
 ├── raw2pc_undistortPoints_single.py
-└── mapping
+├── scene_0000.npz
+├── scene_0000_from_spad.ply
+├── scene_0000_occupied_rgb.ply
+├── scene_0000_profile_surface.ply
+├── living_room_traj0_loop/
+├── SPCSim/
+├── Physics_Aware_Bayesian_Semantic_Geometric_Mapping_for_Single_Photon_LiDAR.pdf
+└── mapping/
     ├── bare_jrnl_new_sample4.tex
     ├── report.bib
     ├── IEEEtran.cls
-    └── name.tex
 ```
 
-## 论文文件说明
+# 论文文件
 
-### `mapping/bare_jrnl_new_sample4.tex`
-
-这是当前最重要的论文主稿，题目是：
+主稿是 `mapping/bare_jrnl_new_sample4.tex`，题目：
 
 ```text
 Photon-Histogram to Occupancy Map:
 Uncertainty-Aware Mapping for Single-Photon LiDAR
 ```
 
-主稿已经写好的部分：
+主稿已经写了方法主线：
 
-- `Abstract`
-- `Introduction`
-- `Related work`
-- `Probabilistic Modeling Preliminaries`
-- `Single-Photon LiDAR Forward Model`
-- `Probabilistic Map Representation`
-- `Method`
-- `Range Posterior from Photon Histograms`
-- `Bayesian Occupancy Update with Range Uncertainty`
-- 一个算法伪代码
+```text
+raw photon histogram
+  -> Poisson/profile likelihood range inference
+  -> range posterior / multi-peak hypotheses
+  -> CDF-marginalized occupancy update
+  -> log-odds occupancy map
+```
 
-主稿还没写完的部分：
+主稿仍未完成的部分包括：
 
 - `BENCHMARK RESULTS`
 - `Datasets`
@@ -73,388 +61,186 @@ Uncertainty-Aware Mapping for Single-Photon LiDAR
 - `Hardware System Setup`
 - `conclusion`
 
-主稿的技术主线：
+`mapping/report.bib` 是参考文献库。主稿里仍有不少空引用 `\cite{}`，后续写论文时需要补真实引用或删掉。
 
-1. 用 Poisson 模型描述 histogram bin count：
+# 核心建图脚本：`spad_npz_occupancy_mapping.py`
 
-   ```text
-   h_b ~ Poisson(lambda_b)
-   ```
+这是当前最重要的建图脚本，已经实现单帧和多帧 `spad_hist` occupancy mapping（占据建图）。
 
-2. 用 IRF / Gaussian pulse 表示单光子 LiDAR 的系统响应：
+输入要求：
 
-   ```text
-   lambda_b = sum_n a_n S(t_b - tau_n) + beta
-   ```
+- 每个 `.npz` 必须包含 `spad_hist`。
+- `spad_hist` 形状应为 `(H, W, T)`。
+- 当前单帧样例 `scene_0000.npz` 包含：
+  - `spad_hist`: `(256, 256, 1000)`, `float32`
+  - `gt_depth`: `(256, 256)`
+  - `phi_bar`: `(256, 256, 1000)`
 
-   其中 `a_n` 是返回强度，`tau_n` 是 ToF，`beta` 是背景光/暗计数。
+主要实现内容：
 
-3. 不直接从 histogram 取单个峰值，而是在候选 range 上计算 likelihood。
-
-4. 对 nuisance parameters `a` 和 `beta` 做 profile likelihood：
-
-   ```text
-   ell(r) = max_{a,beta >= 0} L(r, a, beta)
-   ```
-
-5. 对各个候选 range 的 score 做 softmax，得到离散 posterior：
-
-   ```text
-   p(r | histogram)
-   ```
-
-6. 把 range posterior 通过 inverse sensor model 融合进 occupancy grid。
-
-### `mapping/report.bib`
-
-参考文献库。主稿使用：
-
-```latex
-\bibliography{IEEEabrv,report}
-```
-
-但当前目录里没有 `IEEEabrv.bib`。如果 Overleaf 或本地 BibTeX 报错，可以临时改成：
-
-```latex
-\bibliography{report}
-```
-
-### `mapping/IEEEtran.cls`
-
-IEEE LaTeX 模板类文件。
-
-### `mapping/name.tex`
-
-这是另一个较早版本或废稿，主题更偏：
-
-```text
-Physics-Aware Bayesian Semantic-Geometric Mapping for Single-Photon LiDAR
-```
-
-它包含 CRLB-guided uncertainty、semantic-geometric mapping 等想法，但文件有明显乱码，且引用 `references.bib`，当前目录没有这个文件。后续建议先以 `bare_jrnl_new_sample4.tex` 为主，`name.tex` 仅作为早期思路参考。
-
-## Python 脚本说明
-
-### `raw2pc_undistortPoints.py`
-
-这是较完整的传统 baseline 脚本：把 histogram txt 文件转换成点云。
-
-处理流程：
-
-```text
-histogram txt
-  -> 每个像素取 argmax peak bin
-  -> peak bin 转 depth/range
-  -> 使用相机内参和畸变参数通过 cv2.undistortPoints 得到射线
-  -> depth/range 沿射线投影成 3D point cloud
-  -> 输出 PLY / CSV / intensity-depth 可视化图
-```
-
-关键点：
-
-- 输入默认来自 `./imaging`。
-- 默认匹配文件名类似 `RawDataHistogramMap_frame_0_*.txt`。
-- 默认图像尺寸按 `192 x 256` 或 `256 x 192` 推断。
-- 单个 histogram txt 通常形状是 `49152 x bins`，其中 `49152 = 192 * 256`。
-- 默认时间 bin 宽度 `dt_ps = 750.0` ps。
-- 距离换算：
-
-  ```text
-  bin_to_m = C * dt / 2
-  ```
-
-- 当前代码中有经验校正：
-
-  ```python
-  depth_m_1d = (peak_bin_1d.astype(np.float32) - 17) * bin_to_m
-  ```
-
-- 还会读取 `offset.txt` 做额外校正和过滤；当前仓库里没有 `offset.txt`，运行时需要提供。
-
-常见运行方式示例：
-
-```powershell
-python raw2pc_undistortPoints.py --single-txt path\to\RawDataHistogramMap_frame_0_xxx.txt --output-dir output
-```
-
-主要依赖：
-
-- `numpy`
-- `opencv-python` / `cv2`
-- `matplotlib`
-- `pandas`
-- 可选 `open3d`
-
-这个脚本适合作为论文 baseline：`peak-depth point cloud`。
-
-### `raw2pc_undistortPoints_single.py`
-
-这是单文件、硬编码路径版本的点云转换脚本，更像早期实验脚本。
-
-特点：
-
-- `TXT_PATH` 是硬编码的绝对路径，需要手动改。
-- 输出目录是 `output_from_txt`。
-- 默认 `DT_PS = 750`。
-- 默认用 `peak_bin - 25` 转换为距离。
-- 也使用 `cv2.undistortPoints` 做射线去畸变。
-- 会保存 `intensity_depth_maps.png` 和 `intensity_pointcloud.ply`。
-- 会尝试使用 Open3D 打开可视化窗口。
-
-这个脚本适合理解最简单的单帧处理流程，但后续开发应优先使用 `raw2pc_undistortPoints.py`。
-
-### `test_mapping_profile_3d_pdfalign_fast_v3.py`
-
-这是当前最接近论文方法的核心原型脚本。
-
-目标：
-
-```text
-直接从 histogram txt 构建 occupancy grid，而不是先转确定性点云。
-```
-
-主要流程：
-
-1. 读取 histogram txt：
-
-   ```text
-   shape: U x B
-   U 通常为 49152
-   B 是时间 bin 数，例如 672
-   ```
-
-2. 过滤低信号 ray：
-
-   ```python
-   mx = data.max(axis=1)
-   cand = np.where(mx >= peak_thr)
-   ```
-
-3. 对每条 ray 找 peak：
-
-   ```python
-   mp_find_peaks(...)
-   ```
-
-   支持多峰，但默认参数 `--max_peaks 1`，实际默认仍然是单峰。
-
-4. 对 peak 附近构建 range hypothesis grid：
-
-   ```python
-   compute_ll_grid_numba(...)
-   ```
-
-5. 对每个候选 range 构建 IRF/Gaussian 响应并计算 Poisson profile likelihood：
-
-   ```python
-   profile_ll_one_r_numba(...)
-   ```
-
-6. 对 likelihood 做 softmax，得到离散 posterior/pdf 和 cdf。
-
-7. 从 posterior 中找 peak valley bounds，形成 occupied interval。
-
-8. 沿每条 ray 做 DDA voxel traversal：
-
-   ```python
-   dda_update_dense(...)
-   ```
-
-9. 用 log-odds 更新 dense occupancy grid：
-
-   ```text
-   free: dL_free = logit(p_free) - logit(p0)
-   occ:  dL_occ  = logit(p_occ)  - logit(p0)
-   ```
-
-10. 输出：
-
-    ```text
-    occ_slice.png
-    occupied_rgb.ply
-    ```
-
-关键参数：
-
-```text
---txt              必填，histogram txt 路径
---voxel            voxel 尺寸，默认 0.10 m
---range_max        局部地图 x/y 半径，也作为 ray marching 距离，默认 4.0 m
---z_min            地图 z 下界
---z_max            地图 z 上界
---max_rays         最多使用多少条 ray，默认 3000
---peak_thr         ray 最大 count 低于该值则跳过，默认 50
---Wr_bin           peak 附近 range 搜索窗口，单位 bin，默认 12
---M                range hypothesis 数量，默认 81
---p_occ            occupied 观测概率，默认 0.70
---p_free           free 观测概率，默认 0.35
---p0               occupancy prior，默认 0.50
---tau              softmax temperature，默认 1.0
---win_half         likelihood 计算窗口半宽，默认 25
---sigma_bins       Gaussian IRF 宽度，默认 2.0
---irf              可选，实测 IRF 的 .npy/.txt 文件；不传则使用 Gaussian
---range_model      range 或 z，默认 range
---max_peaks        最大峰数，默认 1
---occ_wmax_vox     occupied interval 最大宽度，单位 voxel，默认 2.5
---max_out          PLY 最大导出点数，0 表示不限制
-```
-
-运行示例：
-
-```powershell
-python test_mapping_profile_3d_pdfalign_fast_v3.py --txt path\to\RawDataHistogramMap_frame_0_xxx.txt --max_rays 3000
-```
-
-如果有实测 IRF：
-
-```powershell
-python test_mapping_profile_3d_pdfalign_fast_v3.py --txt path\to\data.txt --irf path\to\irf.npy
-```
-
-主要依赖：
-
-- `numpy`
-- `matplotlib`
-- `opencv-python` / `cv2`
-- 可选 `numba`，没有 numba 时能跑但会很慢
-
-## 论文与代码的对应关系
-
-| 论文概念 | 代码位置 |
+| 论文概念 | 当前代码 |
 |---|---|
-| Poisson log-likelihood | `_poisson_ll_numba` |
-| profile likelihood over `a,beta` | `profile_ll_one_r_numba` |
-| Gaussian IRF | `build_S_gaussian` |
-| measured IRF | `load_irf_1d`, `build_S_irf` |
-| range hypothesis grid | `compute_ll_grid_numba` |
-| posterior softmax | `compute_ll_grid_numba` |
-| multi-peak detection | `mp_find_peaks` |
-| occupied interval extraction | `peak_valley_bounds_numba` |
-| occupancy grid / log-odds | `dda_update_dense` |
-| peak-depth point cloud baseline | `raw2pc_undistortPoints.py` |
+| Poisson likelihood（泊松似然） | `poisson_ll_numba()` |
+| profile likelihood（剖面似然）消去 `a,beta` | `profile_ll_one_r_numba()` |
+| Gaussian IRF（高斯系统响应） | `build_S_gaussian()` |
+| peak detection（峰值检测） | `mp_find_peaks()` |
+| range hypothesis grid（距离假设网格） | `compute_ll_grid_numba()` |
+| posterior softmax（后验归一化） | `compute_ll_grid_numba()` |
+| posterior CDF（后验累积分布） | `cdf_lookup_numba()` |
+| CDF occupancy update（CDF 占据更新） | `dda_update_dense_cdf()` |
+| entropy adaptive weight（熵自适应权重） | `posterior_entropy_weight()` |
+| 多帧 `T_wc` 位姿读取 | `load_poses_txt()` |
+| 单帧/多帧统一处理 | `process_frame()` |
 
-## 当前实现与论文宣称的差距
+单帧运行示例：
 
-需要特别注意：论文文字中的一些点，目前代码还没有完全实现或没有完全对应。
-
-1. 论文强调 multi-peak posterior，但核心脚本默认：
-
-   ```text
-   --max_peaks 1
-   ```
-
-   也就是说默认实验并没有真正使用多峰。
-
-2. 论文强调 posterior dispersion 产生 adaptive update weights，但当前代码主要是：
-
-   ```text
-   posterior -> occupied interval -> 固定 dL_free / dL_occ
-   ```
-
-   还不是严格的 CDF marginalization 或基于 posterior 方差的自适应权重。
-
-3. 论文公式中使用了完整的 marginal occupancy probability：
-
-   ```text
-   P(voxel occupied | histogram)
-   ```
-
-   但当前代码实现更像工程近似：用 posterior valley bounds 得到区间，然后做普通 free/occupied log-odds 更新。
-
-4. 论文中还有很多空引用：
-
-   ```latex
-   \cite{}
-   ```
-
-   需要补真实文献或删除。
-
-5. `mapping/name.tex` 中的 CRLB/semantic mapping 想法没有在当前 Python 代码中看到完整对应实现。
-
-## 已知缺失文件和运行风险
-
-当前目录里没有实际数据文件。运行 Python 脚本通常还需要：
-
-- `RawDataHistogramMap_frame_0_*.txt` 形式的 histogram txt
-- `offset.txt`，用于 `raw2pc_undistortPoints.py` 的距离校正
-- 可选 IRF 文件，例如 `.npy` 或 `.txt`
-
-本地没有检测到 `pdflatex` 时，无法直接在本机编译论文。可以使用 Overleaf 编译。
-
-Overleaf 如果右侧 PDF 预览报 `PDF渲染错误`，不一定是 LaTeX 编译失败，可能是浏览器或网络无法访问 `compiles.overleafusercontent.com`。
-
-## 建议的接手顺序
-
-1. 先理解传统 baseline：
-
-   ```text
-   raw2pc_undistortPoints.py
-   ```
-
-   目标是明确 `histogram -> peak depth -> point cloud` 的流程。
-
-2. 再理解论文方法原型：
-
-   ```text
-   test_mapping_profile_3d_pdfalign_fast_v3.py
-   ```
-
-   重点看 profile likelihood、posterior、occupancy update。
-
-3. 对照主稿：
-
-   ```text
-   mapping/bare_jrnl_new_sample4.tex
-   ```
-
-   把公式和代码逐项对应。
-
-4. 后续实验至少应包含：
-
-   ```text
-   peak-depth point cloud + mapping baseline
-   vs
-   profile likelihood histogram-to-occupancy method
-   ```
-
-5. 如果要增强创新性，应优先补齐：
-
-   - 真正的 multi-peak 实验；
-   - posterior CDF marginalization 的 occupancy update；
-   - posterior dispersion / entropy / variance 控制 update strength；
-   - 与已有 SPL reconstruction + OctoMap 的比较。
-
-## 建议阅读的前置文献
-
-为了完全理解这个项目，建议按顺序读：
-
-1. Single-Photon LiDAR 基础与综述  
-   Rapp et al., *Advances in Single-Photon Lidar for Autonomous Vehicles*, IEEE Signal Processing Magazine, 2020.
-
-2. 多深度 / 多返回 single-photon imaging  
-   Shin et al., *Computational multi-depth single-photon imaging*, Optics Express, 2016.
-
-3. Bayesian SPL 多表面重建  
-   Tachella et al., *Bayesian 3D Reconstruction of Complex Scenes from Single-Photon Lidar Data*, SIAM Imaging Sciences, 2019.
-
-4. 实时 SPL 3D 重建  
-   Tachella et al., *Real-time 3D reconstruction from single-photon lidar data using plug-and-play point cloud denoisers*, Nature Communications, 2019.
-
-5. Occupancy mapping 基础  
-   Hornung et al., *OctoMap: An Efficient Probabilistic 3D Mapping Framework Based on Octrees*, Autonomous Robots, 2013.
-
-6. 与本项目动机接近的下游不确定性传播工作  
-   Goyal et al., *Robust 3D Object Detection using Probabilistic Point Clouds from Single-Photon LiDARs*, ICCV, 2025.
-
-## 对创新点的当前判断
-
-这个项目的潜在创新点不是单独的 Poisson 建模、profile likelihood 或 occupancy grid。这些都有前人基础。
-
-更准确的创新点应表述为：
-
-```text
-将 single-photon LiDAR 的 raw histogram-level uncertainty 和 multi-peak range hypotheses
-直接融合进 occupancy mapping，避免确定性 depth/point cloud 中间表示导致的错误累积。
+```powershell
+python spad_npz_occupancy_mapping.py --npz scene_0000.npz --max_rays 100
 ```
 
-如果后续实验能证明该方法在低 SNR、多峰、多返回、背景光强或烟雾/遮挡场景下明显减少 phantom occupied voxels，并优于 `peak-depth + occupancy mapping` 以及 `SPL reconstruction + occupancy mapping`，这篇文章才比较容易站住。
+多帧运行示例：
+
+```powershell
+python spad_npz_occupancy_mapping.py --npz-dir path\to\frames --poses path\to\poses.txt --map-min-x -5 --map-max-x 5 --map-min-y -5 --map-max-y 5 --map-min-z 0 --map-max-z 6
+```
+
+`poses.txt` 每行格式：
+
+```text
+frame_key m00 m01 m02 m03 m10 m11 m12 m13 m20 m21 m22 m23 m30 m31 m32 m33
+```
+
+约定：
+
+- `frame_key` 必须等于 `.npz` 文件名去掉扩展名后的 stem（主文件名）。
+- 矩阵是 `T_wc`，即 camera-to-world（相机坐标系到世界坐标系）齐次变换矩阵。
+- 当前假设相机光轴为 `+z`，ray direction（射线方向）由 `[x_n, y_n, 1.0]` 构造。
+- 多帧模式下所有帧共用同一个 dense `Lgrid`（稠密占据栅格）。
+
+输出：
+
+- `scene_0000_occupied_rgb.ply` 或 `--ply-out` 指定路径：占据体素点云。
+- `scene_0000_profile_surface.ply` 或 `--surface-out` 指定路径：profile posterior（剖面后验）峰值表面点。
+
+# 多帧仿真数据：`living_room_traj0_loop`
+
+当前目录中的 `living_room_traj0_loop` 是从 ICL-NUIM 的 `Living Room / traj0 loop` 解压得到的连续室内序列。它适合用于 `spad_npz_occupancy_mapping.py` 的多帧建图验证。
+
+每帧包含：
+
+- `scene_00_xxxx.png`：RGB 图像，分辨率 `640 x 480`
+- `scene_00_xxxx.depth`：文本深度图，按行展开，共 `640*480` 个浮点数
+- `scene_00_xxxx.txt`：相机元数据，含 `cam_pos`、`cam_dir`、`cam_up`、`cam_angle` 等
+
+这里的 `.txt` 不是现成的 `poses.txt`，但已经足够恢复 `T_wc`。
+
+# ICL 序列转 SPAD：`generate_spad_data_icl.py`
+
+`generate_spad_data_icl.py` 用于把 `living_room_traj0_loop` 批量转成 SPAD `.npz` 序列，并导出与多帧建图脚本兼容的 `poses.txt`。
+
+实现要点：
+
+- 读取 `.png` 作为 albedo / intensity（反照率 / 强度）来源。
+- 读取 `.depth` 作为每像素 direct range（直线距离），直接输入 `TransientGenerator`。
+- 解析每帧 `.txt` 中的 `cam_pos / cam_dir / cam_up`，重建 `T_wc`。
+- 输出 `.npz` 与 `poses.txt`，命名保持 `scene_00_xxxx`。
+
+输出 `.npz` 至少包含：
+
+- `spad_hist`
+- `gt_depth`
+- `phi_bar`（仅当 `--save-phi-bar` 打开时）
+
+生成命令示例：
+
+```powershell
+D:/Anaconda3/envs/pytorch/python.exe .\generate_spad_data_icl.py --in-dir .\living_room_traj0_loop\ --out out
+```
+
+如果这条命令成功完成，则 `out/` 中得到的 `.npz + poses.txt` 已经在文件格式上完全适配 `spad_npz_occupancy_mapping.py` 的多帧模式。
+
+重要说明：
+
+- `generate_spad_data_icl.py` 默认输出分辨率是 `256 x 256`。
+- 它内部使用的是 ICL-NUIM 相机内参从 `640x480` 缩放到 `256x256` 后的值：
+  - `fx = 192.48`
+  - `fy = 256.0`
+  - `cx = 127.8`
+  - `cy = 127.733333...`
+- 因此运行多帧建图时，不应继续使用 `spad_npz_occupancy_mapping.py` 的 NYU 默认内参，而应显式传入上面这组 ICL 缩放内参。
+
+通用内参规则：
+
+- `spad_npz_occupancy_mapping.py` 只有在输入 `.npz` 来自 NYU 默认相机模型时，才可以不传 `--fx --fy --cx --cy`。
+- 如果 `.npz` 来自其他相机或其他数据集，应显式传入对应的内参。
+- 最可靠的做法是：生成 `.npz` 时用什么相机模型，建图时就传什么相机模型在当前输出分辨率下的 `fx fy cx cy`。
+
+如果已知原始相机内参和原始分辨率，且只是做了 resize（缩放）而没有 crop（裁剪）或 pad（补边），则可按下面公式计算新分辨率内参：
+
+```text
+sx = new_width  / old_width
+sy = new_height / old_height
+
+fx_new = fx_old * sx
+fy_new = fy_old * sy
+cx_new = cx_old * sx
+cy_new = cy_old * sy
+```
+
+例如 ICL-NUIM 从 `640x480` 缩放到 `256x256`：
+
+```text
+sx = 256 / 640 = 0.4
+sy = 256 / 480 = 0.533333...
+
+fx = 481.20 * 0.4        = 192.48
+fy = 480.00 * 0.533333   = 256.0
+cx = 319.50 * 0.4        = 127.8
+cy = 239.50 * 0.533333   = 127.733333...
+```
+
+如果中间做过 crop（裁剪）或 pad（补边），则不能只做线性缩放，还要把主点一起平移：
+
+```text
+cx_after_crop = cx_old - crop_left
+cy_after_crop = cy_old - crop_top
+```
+
+然后再按 resize 公式继续缩放。
+
+如果数据集根本没有提供相机内参，就不能可靠恢复真实射线方向；这时应优先去查数据集文档、原始标定文件或生成脚本，而不是随意猜一个 `fx fy cx cy`。
+
+推荐多帧建图命令示例：
+
+```powershell
+python spad_npz_occupancy_mapping.py --npz-dir out --poses out\poses.txt --fx 192.48 --fy 256.0 --cx 127.8 --cy 127.7333333 --map-min-x -5 --map-max-x 5 --map-min-y -5 --map-max-y 5 --map-min-z 0 --map-max-z 6
+```
+
+如果只是先快速试跑，也可以额外加上：
+
+```powershell
+--max-frames 20 --max_rays 1000
+```
+
+# 其它脚本
+
+`generate_spad_data.py` 是旧的 NYUv2 单帧 SPAD 仿真脚本。它适合生成单张 SPAD histogram（光子直方图）样例，不适合直接做多帧建图序列，因为 NYUv2 labeled `.mat` 不提供连续轨迹和同一场景下的真实位姿。
+
+`spad_npz_to_ply.py` 是传统 baseline（基线）：对 `spad_hist` 每个像素取最大 bin，转成确定性 depth（深度），再投影成点云。适合做 `peak-depth point cloud` 对照。
+
+`raw2pc_undistortPoints.py` 和 `raw2pc_undistortPoints_single.py` 是面向 histogram txt 的传统点云转换脚本。当前目录没有对应 txt 数据和 `offset.txt`，所以它们主要作为旧 baseline 参考。
+
+`view_npz.py`、`visualize_npz2pointcloud.py` 目前属于本地辅助脚本。
+
+# 当前代码与论文的差距
+
+当前代码已经覆盖论文 Method（方法）部分的主要工程链路，但还不能支撑论文中所有声明。
+
+仍未完整实现或未验证的点：
+
+- 论文 forward model（前向模型）写的是多返回联合叠加 `lambda_b = sum_n a_n S(t_b - tau_n) + beta`；当前代码是 peak-anchored local posterior approximation（峰值锚定局部后验近似），不是联合 mixture model（混合模型）拟合。
+- 当前只使用 Gaussian IRF（高斯系统响应），没有 measured IRF（实测系统响应）加载。
+- 没有实际计算 CRLB / Fisher information（克拉美罗下界 / 费舍尔信息）。
+- 没有 benchmark evaluation（基准评测）脚本，例如 IoU、precision、recall、phantom occupied voxels（虚假占据体素）统计。
+- 没有 OctoMap、peak-depth occupancy mapping、SPL reconstruction + mapping 等 baseline 自动对比。
+- 当前地图是 dense grid（稠密栅格），大范围多帧场景会吃内存；后续可考虑 sparse voxel hash（稀疏体素哈希）或 octree（八叉树）。

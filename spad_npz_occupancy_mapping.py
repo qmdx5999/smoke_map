@@ -655,6 +655,45 @@ def write_surface_ply(path: str, points: np.ndarray) -> None:
     print("saved", path, "N=", points.shape[0])
 
 
+def write_grid_npz(path: str, Lgrid: np.ndarray, mins: np.ndarray, voxel: float) -> None:
+    out_dir = os.path.dirname(path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    np.savez_compressed(
+        path,
+        Lgrid=np.asarray(Lgrid, dtype=np.float32),
+        mins=np.asarray(mins, dtype=np.float32),
+        voxel=np.asarray([voxel], dtype=np.float32),
+    )
+    print("saved", path, "shape=", tuple(int(v) for v in Lgrid.shape))
+
+
+def write_grid_scalar_ply(path: str, Lgrid: np.ndarray, mins: np.ndarray, voxel: float) -> int:
+    out_dir = os.path.dirname(path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    nx, ny, nz = Lgrid.shape
+    with open(path, "w", encoding="ascii") as f:
+        f.write("ply\nformat ascii 1.0\n")
+        f.write(f"element vertex {nx * ny * nz}\n")
+        f.write("property float x\nproperty float y\nproperty float z\n")
+        f.write("property float occupancy\n")
+        f.write("end_header\n")
+        for ix in range(nx):
+            cx = mins[0] + voxel * (ix + 0.5)
+            for iy in range(ny):
+                cy = mins[1] + voxel * (iy + 0.5)
+                for iz in range(nz):
+                    cz = mins[2] + voxel * (iz + 0.5)
+                    L = float(Lgrid[ix, iy, iz])
+                    p = 1.0 / (1.0 + math.exp(-L))
+                    f.write(f"{cx:.6f} {cy:.6f} {cz:.6f} {p:.8f}\n")
+    count = int(nx * ny * nz)
+    print("saved", path, "N=", count, "scalar_field=occupancy")
+    return count
+
+
 def load_spad_hist_npz(path: Path) -> np.ndarray:
     """输入：单个.npz 文件的路径;输出：形状为(H, W, T)的三维 numpy 数组，存储该帧的 SPAD 直方图数据"""
     with np.load(path) as data:
@@ -796,6 +835,12 @@ def process_frame(
     else:
         rays = cand
     print(f"[{frame_key}] using rays: {rays.size}")
+    ray_density_scale = min(1.0, float(args.ray_norm_target) / max(float(rays.size), 1.0))
+    effective_update_scale = float(args.update_scale) * ray_density_scale
+    print(
+        f"[{frame_key}] ray_density_scale={ray_density_scale:.6f} "
+        f"effective_update_scale={effective_update_scale:.6f}"
+    )
 
     end_dist = float(args.range_max)
     range_model_is_range = args.range_model == "range"
@@ -842,6 +887,7 @@ def process_frame(
 
         for pk, pk_score in zip(peaks, peak_scores):
             _tp = time.perf_counter()
+            # 计算距离后验
             r_grid_m, _, pdf_grid = compute_ll_grid_numba(
                 h,
                 int(pk),
@@ -855,7 +901,9 @@ def process_frame(
             t_posterior += time.perf_counter() - _tp
             posterior_evals += 1
             peak_weight = max(float(pk_score), 0.0) / total_peak_score
+            # 后验概率最大的位置
             pk_local = int(np.argmax(pdf_grid))
+            # 后验概率最大的位置对应的深度值和置信度
             peak_depth = float(r_grid_m[pk_local])
             peak_conf = float(pdf_grid[pk_local])
             if peak_depth <= 0.0 or peak_depth > end_dist:
@@ -884,7 +932,7 @@ def process_frame(
         ray_p /= total_prob
         ray_cdf = np.cumsum(ray_p)
         ray_cdf[-1] = 1.0
-        update_weight = posterior_entropy_weight(ray_p, w_min=0.2)
+        update_weight = posterior_entropy_weight(ray_p, w_min=0.2) * effective_update_scale
         t_merge += time.perf_counter() - _tp
 
         # 生成相机坐标系下的原始方向向量
@@ -909,10 +957,13 @@ def process_frame(
             if range_model_is_range:
                 # p3:这个表面点在世界坐标系中的三维坐标;origin_w:相机光心在世界坐标系中的三维坐标
                 # d_w:世界坐标系下的从相机指向这个点的单位方向向量;peak_depth:这个点到相机光心的直线距离
+                # 相机光心 + 方向 × 深度
                 p3 = origin_w + d_w * peak_depth
             else:
                 scale = peak_depth / max(d_w[2], 1e-12)
                 p3 = origin_w + d_w * scale
+            # 这里把每条射线的最大后验概率对应的深度值，通过 origin_w + d_w * peak_depth 投影成世界坐标系下的三维点
+            # peak_conf 作为灰度值编码到 PLY 中
             surface_points.append((float(p3[0]), float(p3[1]), float(p3[2]), float(peak_conf)))
         t_surface += time.perf_counter() - _tp
 
@@ -956,8 +1007,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--tmax-ns", type=float, default=100.0)
     ap.add_argument("--voxel", type=float, default=0.10)
     ap.add_argument("--range_max", type=float, default=5.0)
-    ap.add_argument("--z_min", type=float, default=0.0)
-    ap.add_argument("--z_max", type=float, default=5.0)
+    ap.add_argument("--z_min", type=float, default=-6.0)
+    ap.add_argument("--z_max", type=float, default=6.0)
     ap.add_argument("--map-min-x", type=float, default=None)
     ap.add_argument("--map-max-x", type=float, default=None)
     ap.add_argument("--map-min-y", type=float, default=None)
@@ -970,9 +1021,16 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--M", type=int, default=81)
     ap.add_argument("--p_occ", type=float, default=0.70)
     ap.add_argument("--p_free", type=float, default=0.35)
+    ap.add_argument("--update-scale", type=float, default=1.0, help="Global multiplier for each ray log-odds update; values below 1 reduce saturation.")
+    ap.add_argument(
+        "--ray-norm-target",
+        type=float,
+        default=10000.0,
+        help="Target ray count used to normalize per-frame update strength; scales down updates when a frame uses more rays.",
+    )
     ap.add_argument("--p0", type=float, default=0.50)
-    ap.add_argument("--Lmin", type=float, default=-5.0)
-    ap.add_argument("--Lmax", type=float, default=5.0)
+    ap.add_argument("--Lmin", type=float, default=-10.0)
+    ap.add_argument("--Lmax", type=float, default=10.0)
     ap.add_argument("--tau", type=float, default=1.0)
     ap.add_argument("--win_half", type=int, default=25)
     ap.add_argument("--sigma_bins", type=float, default=2.0)
@@ -982,6 +1040,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--mp_support", type=int, default=0, help="support radius in bins, 0=auto(4*sigma)")
     ap.add_argument("--export-min-prob", type=float, default=0.55)
     ap.add_argument("--max_out", type=int, default=0)
+    ap.add_argument("--grid-out", default=None, help="Optional .npz dump of the full occupancy log-odds grid for later thresholding.")
+    ap.add_argument("--grid-ply-out", default=None, help="Optional PLY dump of all voxels with an occupancy scalar field for CloudCompare thresholding.")
     ap.add_argument("--fx", type=float, default=None)
     ap.add_argument("--fy", type=float, default=None)
     ap.add_argument("--cx", type=float, default=None)
@@ -1056,6 +1116,7 @@ def main() -> None:
             voxel,
             args,
         )
+        # 所有帧的表面点不做任何筛选，直接追加到同一个列表
         all_surface_points.extend(surface_points)
         for key in totals:
             totals[key] += float(stats.get(key, 0.0))
@@ -1074,6 +1135,10 @@ def main() -> None:
         int(args.max_out),
         float(args.export_min_prob),
     )
+    if args.grid_out:
+        write_grid_npz(args.grid_out, Lgrid, mins, voxel)
+    if args.grid_ply_out:
+        write_grid_scalar_ply(args.grid_ply_out, Lgrid, mins, voxel)
     t_output = time.perf_counter() - _tp
     active_count = int(np.count_nonzero(np.abs(Lgrid) > 1e-6))
     print("active voxels:", active_count)
