@@ -8,11 +8,12 @@ the laser period and number of bins.
 """
 
 import argparse
+import json
 import math
 import os
 import time
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import matplotlib
 matplotlib.use("Agg")
@@ -694,6 +695,34 @@ def write_grid_scalar_ply(path: str, Lgrid: np.ndarray, mins: np.ndarray, voxel:
     return count
 
 
+def _decode_npz_scalar(value: np.ndarray) -> str:
+    item = value.item() if value.shape == () else value.reshape(-1)[0]
+    if isinstance(item, bytes):
+        return item.decode("utf-8")
+    return str(item)
+
+
+def load_spad_frame_npz(path: Path) -> Tuple[np.ndarray, Dict[str, object]]:
+    """Load spad_hist and optional camera_model metadata from one .npz frame."""
+    with np.load(path) as data:
+        if "spad_hist" not in data:
+            raise KeyError(f"{path} does not contain a 'spad_hist' array")
+        spad_hist = np.asarray(data["spad_hist"])
+        metadata: Dict[str, object] = {}
+        if "camera_model" in data:
+            raw = _decode_npz_scalar(np.asarray(data["camera_model"]))
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{path}: invalid camera_model JSON: {exc}") from exc
+            if not isinstance(parsed, dict):
+                raise ValueError(f"{path}: camera_model must decode to a JSON object")
+            metadata = parsed
+    if spad_hist.ndim != 3:
+        raise ValueError(f"{path}: spad_hist must have shape (H, W, T), got {spad_hist.shape}")
+    return spad_hist, metadata
+
+
 def load_spad_hist_npz(path: Path) -> np.ndarray:
     """输入：单个.npz 文件的路径;输出：形状为(H, W, T)的三维 numpy 数组，存储该帧的 SPAD 直方图数据"""
     with np.load(path) as data:
@@ -779,9 +808,139 @@ def resolve_map_bounds(args: argparse.Namespace, multi_frame: bool) -> Tuple[np.
     return mins, maxs
 
 
+def metadata_float(metadata: Dict[str, object], key: str, default: Optional[float]) -> Optional[float]:
+    """从 metadata 字典里读取某个字段，并把它转换成 float；如果字段不存在，就返回默认值 default"""
+    if key not in metadata:
+        return default
+    try:
+        value = float(metadata[key])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"camera_model.{key} must be numeric, got {metadata[key]!r}") from exc
+    if not math.isfinite(value):
+        raise ValueError(f"camera_model.{key} must be finite, got {value!r}")
+    return value
+
+
+def resolve_image_y_axis(args: argparse.Namespace, metadata: Dict[str, object]) -> str:
+    """决定当前帧图像 y 轴方向，优先使用命令行参数；如果命令行是 auto，就从 metadata 里读取；如果 metadata 也没有，就默认用 down"""
+    choice = str(args.image_y_axis).lower()
+    # 如果用户不选 auto，就直接返回用户指定值
+    if choice != "auto":
+        return choice
+    # 如果是 auto，就从 metadata 里找,从 metadata 字典里读取 "image_y_axis"；如果没有这个字段，就默认用 "down"
+    value = str(metadata.get("image_y_axis", "down")).lower()
+    if value not in ("down", "up"):
+        raise ValueError(f"camera_model.image_y_axis must be 'down' or 'up', got {value!r}")
+    return value
+
+
+def bbox_from_points(points: List[Tuple[float, float, float, float]]) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """根据当前帧生成的所有表面点 surface_points，计算这一帧点云的 3D bounding box"""
+    if not points:
+        return None
+    arr = np.asarray(points, dtype=np.float64)
+    # 只取前三列 x, y, z
+    xyz = arr[:, :3]
+    return xyz.min(axis=0), xyz.max(axis=0)
+
+
+def bbox_overlap_ratio(
+    a: Optional[Tuple[np.ndarray, np.ndarray]],
+    b: Optional[Tuple[np.ndarray, np.ndarray]],
+) -> float:
+    if a is None or b is None:
+        return 0.0
+    # 交集的最小角要取两个最小角里更大的那个
+    lo = np.maximum(a[0], b[0])
+    # 交集的最大角要取两个最大角里更小的那个
+    hi = np.minimum(a[1], b[1])
+    # 计算交集盒子的长宽高
+    extent = np.maximum(hi - lo, 0.0)
+    # 计算交集体积,np.prod(extent) 是把三个方向的边长相乘,inter = intersection_volume
+    inter = float(np.prod(extent))
+    # 计算两个 bbox 各自的体积
+    vol_a = float(np.prod(np.maximum(a[1] - a[0], 0.0)))
+    vol_b = float(np.prod(np.maximum(b[1] - b[0], 0.0)))
+    # 得到较小 bbox 的体积,denominator分母
+    denom = max(min(vol_a, vol_b), 1e-12)
+    # intersection / smaller_volume,交集体积占较小 bbox 体积的比例
+    return inter / denom
+
+
+def merge_bboxes(
+    a: Optional[Tuple[np.ndarray, np.ndarray]],
+    b: Optional[Tuple[np.ndarray, np.ndarray]],
+) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """把两个 3D bbox 合并成一个更大的 bbox，使新的 bbox 能同时包住原来的两个 bbox"""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return np.minimum(a[0], b[0]), np.maximum(a[1], b[1])
+
+
+def format_bbox(bbox: Optional[Tuple[np.ndarray, np.ndarray]]) -> str:
+    if bbox is None:
+        return "empty"
+    mn, mx = bbox
+    return (
+        f"min=({mn[0]:.3f},{mn[1]:.3f},{mn[2]:.3f}) "
+        f"max=({mx[0]:.3f},{mx[1]:.3f},{mx[2]:.3f})"
+    )
+
+
+def parse_diagnostic_checkpoints(value: str, total_frames: int) -> List[int]:
+    """
+    把用户输入的诊断检查点字符串，例如 "5,50,all"，解析成一个去重、升序排列的整数帧数列表，
+    用来决定程序处理到哪些帧时打印 occupancy grid 的诊断信息
+    """
+    # set() 是 Python 里的集合类型,不允许重复元素,没有固定顺序,适合用来做去重
+    out = set()
+    # 把输入字符串按逗号拆开,例如"5,50,all"会拆成["5", "50", "all"]
+    for raw in str(value).split(","):
+        # 清理空格并转小写,.lower() 是字符串方法，作用是把字符串中的英文字母全部转成小写
+        token = raw.strip().lower()
+        # 如果用户写了多余的逗号,中间会出现空字符串 ""，这里直接跳过
+        if not token:
+            continue
+        if token == "all":
+            out.add(int(total_frames))
+        # 如果 token 不是 "all"，就尝试把它转换成整数,例如"50" -> 50
+        else:
+            n = int(token)
+            # 只接受正整数。0 和负数会被忽略
+            if n > 0:
+                out.add(min(n, int(total_frames)))
+    # 返回排序后的结果,因为 set 本身没有顺序，所以最后用 sorted 排序
+    return sorted(out)
+
+
+def print_grid_diagnostics(label: str, Lgrid: np.ndarray, export_min_prob: float) -> None:
+    # 把 Lgrid 里的 log-odds 值转成普通概率
+    prob = 1.0 / (1.0 + np.exp(-Lgrid.astype(np.float64)))
+    # 初始的 Lgrid 全是 0,如果某个 voxel 被 ray 更新过，它的 Lgrid 通常会偏离 0,active voxel = 被更新过的 voxel
+    active = np.abs(Lgrid) > 1e-6
+    # 占用概率大于等于 0.51 的 voxel，被认为是 occupied。
+    occ = prob >= float(export_min_prob)
+    # prob.reshape(-1)把三维概率网格拉平成一维数组,
+    q_all = np.quantile(prob.reshape(-1), [0.0, 0.5, 0.9, 0.99, 1.0])
+    if np.any(active):
+        q_active = np.quantile(prob[active], [0.0, 0.1, 0.5, 0.9, 1.0])
+        active_text = np.array2string(q_active, precision=4, separator=", ")
+    else:
+        active_text = "[]"
+    print(
+        f"[diagnostic {label}] active_voxels={int(active.sum())} "
+        f"occupied_voxels@{export_min_prob:g}={int(occ.sum())} "
+        f"prob_quantiles_all={np.array2string(q_all, precision=4, separator=', ')} "
+        f"prob_quantiles_active={active_text}"
+    )
+
+
 def process_frame(
     frame_key: str,
     spad_hist: np.ndarray,
+    frame_metadata: Dict[str, object],
     T_wc: np.ndarray,
     Lgrid: np.ndarray,
     mins: np.ndarray,
@@ -794,16 +953,44 @@ def process_frame(
     print(f"[{frame_key}] spad_hist shape={spad_hist.shape}, dtype={spad_hist.dtype}")
     print(f"[{frame_key}] bin_to_m={bin_to_m:.8f} m/bin, tmax={args.tmax_ns:g} ns")
 
+    # 最终 fx, fy, cx, cy 的来源优先级是
+    # 第 1 优先级：命令行参数
+    # 例如 --fx、--fy、--cx、--cy
+
+    # 第 2 优先级：.npz 文件里的 camera_model metadata
+    # 例如 frame_metadata["fx"]
+
+    # 第 3 优先级：根据图像尺寸缩放后的 NYU 默认内参
+    # 例如 scaled_nyu_intrinsics(W, H)
+    
+    # 先根据当前 spad_hist 的宽高 W, H 算一套默认相机内参
     default_fx, default_fy, default_cx, default_cy = scaled_nyu_intrinsics(W, H)
+    # 如果用户在命令行传了 --fx --fy --cx --cy，就用用户传的；否则先用默认值
     fx = default_fx if args.fx is None else args.fx
     fy = default_fy if args.fy is None else args.fy
     cx = default_cx if args.cx is None else args.cx
     cy = default_cy if args.cy is None else args.cy
+    # 如果用户没有手动传入这些参数，那么程序再尝试从 .npz 文件的 frame_metadata 里读取更准确的内参
+    # 如果 metadata 里没有，就继续保留刚才的默认值
+    fx = metadata_float(frame_metadata, "fx", fx) if args.fx is None else fx
+    fy = metadata_float(frame_metadata, "fy", fy) if args.fy is None else fy
+    cx = metadata_float(frame_metadata, "cx", cx) if args.cx is None else cx
+    cy = metadata_float(frame_metadata, "cy", cy) if args.cy is None else cy
+    # 决定当前图像的 y 轴方向
+    image_y_axis = resolve_image_y_axis(args, frame_metadata)
     print(f"[{frame_key}] intrinsics fx={fx:.4f}, fy={fy:.4f}, cx={cx:.4f}, cy={cy:.4f}")
+    print(f"[{frame_key}] image_y_axis={image_y_axis}")
 
+    # 生成两个二维数组,u_grid从每一列上看都是横坐标 u,v_grid从每一行上看都是纵坐标 v
+    # u_grid就是整张图每个像素的 u 坐标表，v_grid就是整张图每个像素的 v 坐标表
     u_grid, v_grid = np.meshgrid(np.arange(W, dtype=np.float64), np.arange(H, dtype=np.float64))
+    # reshape(-1)把二维数组拉平成一维数组，把像素横坐标 u 转成归一化相机坐标 x_n
     x_n_all = ((u_grid.reshape(-1) - cx) / fx).astype(np.float64)
     y_n_all = ((v_grid.reshape(-1) - cy) / fy).astype(np.float64)
+    # 默认情况下y_n = (v - cy) / fy当 v 往下增大时，y_n 也增大,这对应的是图像 y 轴向下
+    # 但如果 image_y_axis == "up"，说明当前相机模型约定相机/图像的 y 轴向上,这时需要把 y_n 取反
+    if image_y_axis == "up":
+        y_n_all = -y_n_all
 
     # T_wc：相机坐标系 → 世界坐标系的齐次变换矩阵
     if T_wc.shape != (4, 4):
@@ -812,8 +999,14 @@ def process_frame(
     R_wc = np.asarray(T_wc[:3, :3], dtype=np.float64)
     # origin_w：3x1 平移向量，描述相机在世界坐标系中的位置,也就是这一帧相机光心的三维坐标
     origin_w = np.asarray(T_wc[:3, 3], dtype=np.float64)
+    print(
+        f"[{frame_key}] pose basis x={np.array2string(R_wc[:, 0], precision=4)} "
+        f"y={np.array2string(R_wc[:, 1], precision=4)} "
+        f"z={np.array2string(R_wc[:, 2], precision=4)}"
+    )
 
     mx = hist_data.max(axis=1)
+    # cand 是候选 ray 的索引数组
     cand = np.where(mx >= args.peak_thr)[0]
     print(f"[{frame_key}] candidate rays: {cand.size}")
     if cand.size == 0:
@@ -829,14 +1022,21 @@ def process_frame(
             "t_dda": 0.0,
         }
 
+    # 需要下采样
     if args.max_rays > 0 and cand.size > args.max_rays:
+        # 在 [0, cand.size - 1] 这个范围内，均匀生成 args.max_rays 个索引，.astype(np.int64)再转成整数
         sel = np.linspace(0, cand.size - 1, args.max_rays).astype(np.int64)
+        # 从候选 ray 里均匀抽出 args.max_rays 条
         rays = cand[sel]
+    # 不需要下采样
     else:
         rays = cand
     print(f"[{frame_key}] using rays: {rays.size}")
+    # 一个缩放系数,0 < ray_density_scale <= 1.0,作用是根据 ray 数量调整每条 ray 的更新强度.ray 太多时可以缩小；ray 太少时不放大。
     ray_density_scale = min(1.0, float(args.ray_norm_target) / max(float(rays.size), 1.0))
+    # 当前帧真正使用的更新强度系数,effective_update_scale = 用户设置的基础更新强度 × ray 数量归一化系数
     effective_update_scale = float(args.update_scale) * ray_density_scale
+    # 目的都是当一帧有很多 ray 时，降低每条 ray 的更新强度，防止 occupancy grid 被过多 ray 更新得过快、过强、过早饱和
     print(
         f"[{frame_key}] ray_density_scale={ray_density_scale:.6f} "
         f"effective_update_scale={effective_update_scale:.6f}"
@@ -932,6 +1132,7 @@ def process_frame(
         ray_p /= total_prob
         ray_cdf = np.cumsum(ray_p)
         ray_cdf[-1] = 1.0
+        # 计算这条 ray 的最终更新权重，后验熵权重 × 全局更新强度 × ray 数量归一化系数
         update_weight = posterior_entropy_weight(ray_p, w_min=0.2) * effective_update_scale
         t_merge += time.perf_counter() - _tp
 
@@ -1006,9 +1207,9 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--surface-out", default=DEFAULT_SURFACE_OUT)
     ap.add_argument("--tmax-ns", type=float, default=100.0)
     ap.add_argument("--voxel", type=float, default=0.10)
-    ap.add_argument("--range_max", type=float, default=5.0)
-    ap.add_argument("--z_min", type=float, default=-6.0)
-    ap.add_argument("--z_max", type=float, default=6.0)
+    ap.add_argument("--range_max", type=float, default=7.0)
+    ap.add_argument("--z_min", type=float, default=-7.0)
+    ap.add_argument("--z_max", type=float, default=7.0)
     ap.add_argument("--map-min-x", type=float, default=None)
     ap.add_argument("--map-max-x", type=float, default=None)
     ap.add_argument("--map-min-y", type=float, default=None)
@@ -1019,9 +1220,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--peak_thr", type=float, default=5.0)
     ap.add_argument("--Wr_bin", type=int, default=12)
     ap.add_argument("--M", type=int, default=81)
-    ap.add_argument("--p_occ", type=float, default=0.70)
-    ap.add_argument("--p_free", type=float, default=0.35)
-    ap.add_argument("--update-scale", type=float, default=1.0, help="Global multiplier for each ray log-odds update; values below 1 reduce saturation.")
+    ap.add_argument("--p_occ", type=float, default=0.65)
+    ap.add_argument("--p_free", type=float, default=0.45)
+    # 全局更新强度系数,每条 ray 更新 occupancy grid 时，不要用完整强度，而是乘一个较小系数
+    ap.add_argument("--update-scale", type=float, default=0.01, help="Global multiplier for each ray log-odds update; values below 1 reduce saturation.")
+    # 参考 ray 数量,如果当前帧 ray 数量不超过 10000，就不缩小;如果当前帧 ray 数量超过 10000，就按比例缩小每条 ray 的更新强度
     ap.add_argument(
         "--ray-norm-target",
         type=float,
@@ -1036,9 +1239,9 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--sigma_bins", type=float, default=2.0)
     ap.add_argument("--range_model", choices=["range", "z"], default="range")
     ap.add_argument("--max_peaks", type=int, default=2)
-    ap.add_argument("--mp_thr", type=float, default=5.0)
+    ap.add_argument("--mp_thr", type=float, default=10.0)
     ap.add_argument("--mp_support", type=int, default=0, help="support radius in bins, 0=auto(4*sigma)")
-    ap.add_argument("--export-min-prob", type=float, default=0.55)
+    ap.add_argument("--export-min-prob", type=float, default=0.51)
     ap.add_argument("--max_out", type=int, default=0)
     ap.add_argument("--grid-out", default=None, help="Optional .npz dump of the full occupancy log-odds grid for later thresholding.")
     ap.add_argument("--grid-ply-out", default=None, help="Optional PLY dump of all voxels with an occupancy scalar field for CloudCompare thresholding.")
@@ -1046,6 +1249,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--fy", type=float, default=None)
     ap.add_argument("--cx", type=float, default=None)
     ap.add_argument("--cy", type=float, default=None)
+    ap.add_argument("--image-y-axis", choices=["auto", "down", "up"], default="auto")
+    ap.add_argument(
+        "--diagnostic-checkpoints",
+        default="all",
+        help="Comma-separated frame counts for grid diagnostics; use 'all' for the final frame.",
+    )
     ap.add_argument("--profile", action="store_true", help="Print timing breakdown for major pipeline stages.")
     return ap.parse_args()
 
@@ -1055,9 +1264,17 @@ def main() -> None:
     multi_frame = args.npz_dir is not None
     if multi_frame and args.poses is None:
         raise ValueError("--poses is required when using --npz-dir")
+    # 多帧模式下不建议使用 range_model == "z"
+    if multi_frame and args.range_model == "z":
+        print(
+            "warning: --range_model z uses world z in the current dense-grid updater; "
+            "ICL multi-frame data should use --range_model range."
+        )
 
     if multi_frame:
+        # 去 args.npz_dir 目录下找所有 .npz 文件，并按文件名排序,frames 是一个列表，里面放的是每一帧 .npz 文件的路径
         frames = discover_npz_frames(args.npz_dir, int(args.max_frames))
+        # poses 是一个字典，保存每一帧对应的相机位姿矩阵,其中 key 是帧名，value 是这一帧的 4x4 相机位姿矩阵
         poses = load_poses_txt(args.poses)
         missing = [p.stem for p in frames if p.stem not in poses]
         if missing:
@@ -1069,11 +1286,15 @@ def main() -> None:
         frames = [Path(args.npz)]
         poses = {frames[0].stem: np.eye(4, dtype=np.float64)}
         print("single-frame mode")
+    # 生成诊断检查点,diagnostic_checkpoints 是一个 list[int]整数列表,表示处理到哪些帧时打印 grid 诊断信息
+    diagnostic_checkpoints = parse_diagnostic_checkpoints(args.diagnostic_checkpoints, len(frames))
 
     voxel = float(args.voxel)
-    # 得到地图边界
+    # 得到地图边界,mins 是一个长度为 3 的 NumPy 数组,mins = np.array([min_x, min_y, min_z])表示地图在世界坐标系中的最小边界坐标
     mins, maxs = resolve_map_bounds(args, multi_frame)
     # maxs - mins：计算 x、y、z 三个方向的总长度,除以体素边长得到每个方向需要的体素数量
+    # 例如mins = [-7, -7, -7],maxs = [ 7,  7,  7],voxel = 0.1,那么maxs - mins = [14, 14, 14],dims = [140, 140, 140]
+    # 也就是创建一个Lgrid.shape = (140, 140, 140)的三维占用栅格
     dims = np.ceil((maxs - mins) / voxel).astype(np.int64)
     nx, ny, nz = int(dims[0]), int(dims[1]), int(dims[2])
     print("grid mins =", mins, "maxs =", maxs)
@@ -1100,26 +1321,62 @@ def main() -> None:
         "t_dda": 0.0,
     }
     t0 = time.time()
+    # 用来累计保存所有已处理帧的 3D bounding box
+    accumulated_bbox: Optional[Tuple[np.ndarray, np.ndarray]] = None
 
     for frame_i, frame_path in enumerate(frames, start=1):
         # 取出当前帧文件的文件名，就是去掉.npz后缀，也就是帧名，这个帧名会用来从poses字典中查找对应的相机位姿矩阵
         frame_key = frame_path.stem
         print(f"loading frame {frame_i}/{len(frames)}: {frame_path}")
-        # 加载当前帧的 SPAD 直方图数据，返回值spad_hist是一个三维 numpy 数组，形状为(H, W, T)
-        spad_hist = load_spad_hist_npz(frame_path)
+        # 从当前这一帧的 .npz 文件中读取 SPAD 直方图数据，以及可选的相机模型元数据
+        spad_hist, frame_metadata = load_spad_frame_npz(frame_path)
+        # surface_points：当前帧估计出来的表面点列表，例如surface_points = [
+        #     (0.2, -0.1, 1.5, 0.08),
+        #     (0.5,  0.3, 2.0, 0.10),
+        #     (-0.4, 0.2, 1.2, 0.06),
+        # ]
+        # stats：当前帧的统计信息字典,stats = {
+        #     "rays_total": ...,    当前帧实际处理了多少条 ray
+        #     "rays_with_peaks": ...,    有检测到峰值的 ray 数量
+        #     "rays_fused": ...,    真正融合进 occupancy grid 的 ray 数量
+        #     "posterior_evals": ...,    做了多少次距离后验计算
+        #     "t_peak": ...,    各种耗时
+        #     "t_posterior": ...,
+        #     "t_merge": ...,
+        #     "t_surface": ...,
+        #     "t_dda": ...,
+        # }
         surface_points, stats = process_frame(
             frame_key,
             spad_hist,
+            frame_metadata,
             poses[frame_key],
             Lgrid,
             mins,
             voxel,
             args,
         )
-        # 所有帧的表面点不做任何筛选，直接追加到同一个列表
+
+        # 当前帧生成的所有表面点在世界坐标系中的 3D bounding box,例如frame_bbox = (
+        #     np.array([-0.4, -0.1, 1.2]),    所有点在 x/y/z 三个方向上的最小坐标
+        #     np.array([ 0.5,  0.3, 2.0])     所有点在 x/y/z 三个方向上的最大坐标
+        # )
+        frame_bbox = bbox_from_points(surface_points)
+        # 当前帧的点云bounding box frame_bbox，和之前所有帧累计bounding box accumulated_bbox 的重叠程度
+        # 用于检查当前帧生成的表面点范围，和之前累计的点云范围是否接近,如果 overlap 较高，说明当前帧点云空间范围和已有点云有较多重叠
+        overlap = bbox_overlap_ratio(frame_bbox, accumulated_bbox)
+        print(
+            f"[{frame_key}] surface bbox {format_bbox(frame_bbox)} "
+            f"overlap_with_previous={overlap:.4f}"
+        )
+        # 把“之前累计的包围盒” accumulated_bbox 和“当前帧的包围盒” frame_bbox 合并，得到新的累计包围盒
+        accumulated_bbox = merge_bboxes(accumulated_bbox, frame_bbox)
         all_surface_points.extend(surface_points)
         for key in totals:
             totals[key] += float(stats.get(key, 0.0))
+        # 如果当前处理到的帧编号 frame_i 在诊断检查点列表里，就打印一次当前 Lgrid 的诊断统计
+        if frame_i in diagnostic_checkpoints:
+            print_grid_diagnostics(f"frame {frame_i}", Lgrid, float(args.export_min_prob))
 
     print("all frames done. elapsed(s)=", round(time.time() - t0, 2))
     _tp = time.perf_counter()
