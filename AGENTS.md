@@ -267,6 +267,16 @@ cx = 319.50 * (256 / 640) = 127.8
 cy = 239.50 * (256 / 480) = 127.733333...
 ```
 
+ICL 内参来源与缩放原因（刷新 AGENTS.md 时必须保留）：
+
+- 后续刷新或重写 `AGENTS.md` 时，必须同时保留上面的 “ICL 内参从 `640x480` 缩放到 `256x256`” 公式块，以及本段 “ICL 内参来源与缩放原因” 说明。
+- `fx/fy/cx/cy` 是 camera intrinsics（相机内参），用于把像素 `(u,v)` 反投影成归一化相机射线：`x_n = (u - cx) / fx`、`y_n = (v - cy) / fy`，再形成 ray direction（射线方向）近似 `[x_n, y_n, 1]`。
+- 原始 ICL-NUIM RGB-D 图像分辨率是 `640x480`，原始内参是 `fx=481.20, fy=480.00, cx=319.50, cy=239.50`；当前生成的 SPAD histogram（光子直方图）分辨率是 `256x256`，所以内参必须随 resize（缩放）按宽高比例同步缩放。
+- 横向参数 `fx/cx` 按宽度比例 `256 / 640` 缩放，纵向参数 `fy/cy` 按高度比例 `256 / 480` 缩放。`fx` 和 `fy` 的缩放比例不同，是因为原始宽高 `640x480` 被缩放成正方形 `256x256`。
+- 这些值必须和生成 `.npz` 时的输出分辨率一致，否则每个 histogram pixel（直方图像素）对应的 ray direction（射线方向）会错，多帧建图会出现空间拉伸、压缩或错位。
+- 当前新版 `out/*.npz` 已包含 `camera_model` metadata（相机模型元数据），建图脚本在不手动传 `--fx/--fy/--cx/--cy` 时可以自动读取这些值；命令中显式填写这些值主要是为了实验可复现，并兼容旧 `.npz` 没有 metadata 的情况。
+- 后续刷新或重写 `AGENTS.md` 时，不要只保留内参数值，必须保留“为什么要这样缩放”和“这些内参用于像素到 ray（射线）反投影”的解释。
+
 # 推荐建图命令
 
 100 帧快速验证：
@@ -334,18 +344,36 @@ active p25/p50/p75/p95/p99 ≈ 0.112 / 0.485 / 0.507 / 0.776 / 0.998
 D:/Anaconda3/envs/pytorch/python.exe .\analyze_occupancy_grid.py --grid .\full.npz --hist-out full.png
 ```
 
-`export_occupancy_from_grid.py` 用于从保存好的 `--grid-out` 结果重新按阈值导出 PLY，不必重跑 histogram mapping（直方图建图）。
+`export_occupancy_from_grid.py` 用于从保存好的 `--grid-out` 结果重新按阈值导出 PLY，不必重跑 histogram mapping（直方图建图）。它读取 `Lgrid/mins/voxel`，把 log-odds grid（对数几率栅格）转换成 occupancy probability（占据概率）：
 
-推荐从 `full.npz` 导出多个阈值观察：
+```text
+p = sigmoid(Lgrid) = 1 / (1 + exp(-Lgrid))
+```
+
+默认 `--mode occupied` 会导出 active voxels（活跃体素）中满足 `--min-prob <= p <= --max-prob` 的体素。`--mode active` 会导出所有 active voxels，并同样保留每个体素的 `occupancy` scalar field（占据概率标量场）。
+
+输出 PLY 字段为：
+
+```text
+x y z red green blue occupancy
+```
+
+其中 `red/green/blue` 是灰度 fallback（兜底颜色），`occupancy` 是推荐在 CloudCompare 中使用的 scalar field（标量场）。CloudCompare 导入 PLY 时应把 `occupancy` 添加/识别为 scalar field；导入后把颜色显示切到 `Scalar field`，再用 color scale（色带）表达占据概率高低。蓝/绿/黄/红等颜色由 CloudCompare 当前 color scale 决定；代码决定的是每个点携带的 `occupancy` 数值。
+
+推荐从 `max5k.npz` 或 `full.npz` 导出多个阈值观察：
 
 ```powershell
+D:/Anaconda3/envs/pytorch/python.exe .\export_occupancy_from_grid.py --grid .\max5k.npz --ply-out max5k_occ_scalar.ply --min-prob 0.5
+D:/Anaconda3/envs/pytorch/python.exe .\export_occupancy_from_grid.py --grid .\max5k.npz --ply-out max5k_occ055.ply --min-prob 0.55
+D:/Anaconda3/envs/pytorch/python.exe .\export_occupancy_from_grid.py --grid .\max5k.npz --ply-out max5k_occ070.ply --min-prob 0.70
+D:/Anaconda3/envs/pytorch/python.exe .\export_occupancy_from_grid.py --grid .\max5k.npz --ply-out max5k_active.ply --mode active
 D:/Anaconda3/envs/pytorch/python.exe .\export_occupancy_from_grid.py --grid .\full.npz --ply-out full_occ055.ply --min-prob 0.55
 D:/Anaconda3/envs/pytorch/python.exe .\export_occupancy_from_grid.py --grid .\full.npz --ply-out full_occ060.ply --min-prob 0.60
 D:/Anaconda3/envs/pytorch/python.exe .\export_occupancy_from_grid.py --grid .\full.npz --ply-out full_occ070.ply --min-prob 0.70
 D:/Anaconda3/envs/pytorch/python.exe .\export_occupancy_from_grid.py --grid .\full.npz --ply-out full_occ090.ply --min-prob 0.90
 ```
 
-当前 `--export-min-prob` 默认是 `0.51`，导出的 occupied cloud（占据点云）会偏宽，适合保留弱占据证据；如果想看高置信结构，优先看 `0.70` 或 `0.90`。
+当前建图脚本里的 `--export-min-prob` 默认是 `0.51`，直接随建图导出的 occupied cloud（占据点云）会偏宽，适合保留弱占据证据；如果想看高置信结构，优先用 `export_occupancy_from_grid.py` 从 `--grid-out` 的 `.npz` 重新导出 `0.70` 或 `0.90` 阈值版本。
 
 # 其它脚本
 

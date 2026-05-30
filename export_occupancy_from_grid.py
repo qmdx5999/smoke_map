@@ -2,7 +2,8 @@
 
 This is a post-processing helper for spad_npz_occupancy_mapping.py --grid-out.
 It lets you adjust occupancy thresholds without rerunning the expensive mapping
-stage.
+stage. The exported PLY stores both RGB fallback colors and an occupancy scalar
+field for CloudCompare color-scale visualization.
 """
 
 import argparse
@@ -21,7 +22,12 @@ def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
     ap.add_argument("--grid", required=True, help=".npz file produced by --grid-out")
     ap.add_argument("--ply-out", required=True, help="Output thresholded PLY path")
-    ap.add_argument("--min-prob", type=float, default=0.5, help="Minimum occupancy probability to export")
+    ap.add_argument(
+        "--min-prob",
+        type=float,
+        default=0.5,
+        help="Minimum occupancy probability to export. With active filtering, 0.5 exports p > 0.5 voxels.",
+    )
     ap.add_argument("--max-prob", type=float, default=1.0, help="Maximum occupancy probability to export")
     ap.add_argument(
         "--active-eps",
@@ -39,6 +45,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def write_ply(path: str, xyz: np.ndarray, prob: np.ndarray) -> None:
+    """Write occupied voxel centers with occupancy scalar field.
+
+    RGB is a grayscale fallback. In CloudCompare, prefer the occupancy scalar
+    field and choose a color scale to show probability differences.
+    """
     out_dir = os.path.dirname(path)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
@@ -80,10 +91,12 @@ def main() -> None:
 
     write_ply(args.ply_out, xyz, prob)
     print("saved", args.ply_out, "N=", int(xs.size), "mode=", args.mode)
+    print("PLY fields: x y z red green blue occupancy")
+    print("CloudCompare: select scalar field 'occupancy' and apply a color scale")
     print("active voxels:", int(np.count_nonzero(active)))
     if xs.size:
         print("prob range:", float(prob.min()), float(prob.max()))
-        print("equivalent log-odds threshold:", logit(args.min_prob))
+        print("min_prob:", float(args.min_prob), "equivalent log-odds threshold:", logit(args.min_prob))
 
 
 if __name__ == "__main__":

@@ -1379,6 +1379,7 @@ def main() -> None:
             print_grid_diagnostics(f"frame {frame_i}", Lgrid, float(args.export_min_prob))
 
     print("all frames done. elapsed(s)=", round(time.time() - t0, 2))
+    print("accumulated surface bbox", format_bbox(accumulated_bbox))
     _tp = time.perf_counter()
     if all_surface_points:
         write_surface_ply(args.surface_out, np.asarray(all_surface_points, dtype=np.float32))
