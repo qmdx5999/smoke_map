@@ -1,7 +1,13 @@
 __pycache__/
 *.npz
 *.ply
-data
 *.pdf
 *.png
 mapping
+view_npz.py
+visualize_npz2pointcloud.py
+living_room_traj0_loop
+out
+*.jpg
+plot_pixel_histogram.py
+generate_spad_data.py
