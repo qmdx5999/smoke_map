@@ -19,6 +19,7 @@ Output:
 
 import argparse
 import json
+import math
 import re
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -44,6 +45,9 @@ FOG_BETA_BIN = 0.01
 FOG_ALPHA = 1000
 
 DCR_CPS = 100
+
+GEN_FOG_CONFIG: Dict[str, object] = {}
+LAST_EXTRA_SAVE: Dict[str, np.ndarray] = {}
 
 NR = 256
 NC = 256
@@ -74,6 +78,91 @@ def make_fog_phi_bar(nr: int, nc: int, device: str):
     return (
         torch.tensor(phi_fog, device=device)
         .unsqueeze(0)
+        .unsqueeze(0)
+        .expand(nr, nc, -1)
+        .contiguous()
+    )
+
+
+def build_gaussian_irf_1d(center_bin: float, sigma_bins: float, n_bins: int, device: str):
+    x = torch.arange(n_bins, dtype=torch.float32, device=device)
+    sigma = max(float(sigma_bins), 1e-6)
+    irf = torch.exp(-0.5 * ((x - float(center_bin)) / sigma) ** 2)
+    total = torch.sum(irf)
+    if float(total.detach().cpu()) > 0.0:
+        irf = irf / total
+    return irf
+
+
+def make_gamma_fog_phi_bar(
+    nr: int,
+    nc: int,
+    gamma_k: float,
+    gamma_beta_bin: float,
+    fog_photons: float,
+    device: str,
+):
+    from scipy.stats import gamma as sp_gamma
+
+    bin_size = TMAX * 1e-9 / N_TBINS
+    beta_time = float(gamma_beta_bin) / bin_size
+    t_bins = np.arange(N_TBINS, dtype=np.float64) * bin_size
+    fog_pdf = sp_gamma.pdf(t_bins, a=float(gamma_k) + 1.0, scale=1.0 / beta_time)
+    total = fog_pdf.sum()
+    if total > 0:
+        fog_pdf /= total
+    phi_fog = (fog_pdf * float(fog_photons)).astype(np.float32)
+    return (
+        torch.tensor(phi_fog, device=device)
+        .unsqueeze(0)
+        .unsqueeze(0)
+        .expand(nr, nc, -1)
+        .contiguous()
+    )
+
+
+def make_ray_integral_smoke_phi_bar(
+    nr: int,
+    nc: int,
+    sigma: float,
+    density: float,
+    fog_step: float,
+    range_max: float,
+    device: str,
+):
+    """
+    nr, nc      图像高度和宽度
+    sigma       雾的消光系数
+    density     均匀烟雾后向散射密度
+    fog_step    沿 ray 采样的步长，单位 m
+    range_max   烟雾积分的最远距离，单位 m
+    device      cpu 或 cuda
+    """
+    dmax = 3e8 * TMAX * 1e-9 / 2
+    step = max(float(fog_step), 1e-6)
+    rmax = min(max(float(range_max), 0.0), float(dmax))
+    if rmax <= 0.0 or float(density) <= 0.0:
+        return torch.zeros((nr, nc, N_TBINS), dtype=torch.float32, device=device)
+
+    sigma_bins = FWHM / (2.355 * (TMAX / N_TBINS))
+    # 生成一条长度为 N_TBINS 的一维曲线,表示：某一个像素上的烟雾散射时间响应
+    profile = torch.zeros(N_TBINS, dtype=torch.float32, device=device)
+    # 生成沿 ray 的采样点
+    s_values = np.arange(0.0, rmax + 0.5 * step, step, dtype=np.float64)
+    # 遍历每个烟雾采样点
+    for s in s_values:
+        # 把物理距离转成 histogram 的 bin 坐标
+        center_bin = (s / dmax) * N_TBINS
+        # 给该距离位置生成一个高斯脉冲
+        irf = build_gaussian_irf_1d(center_bin, sigma_bins, N_TBINS, device)
+        # 计算这个烟雾采样点的权重
+        weight = float(density) * math.exp(-2.0 * float(sigma) * float(s)) * step
+        # 累加到烟雾 profile
+        profile = profile + irf * float(weight)
+
+    # 把一维 profile 扩展到所有像素
+    return (
+        profile.unsqueeze(0)
         .unsqueeze(0)
         .expand(nr, nc, -1)
         .contiguous()
@@ -251,6 +340,37 @@ def build_camera_model_metadata(fx: float, fy: float, cx: float, cy: float, widt
     return json.dumps(camera_model, sort_keys=True)
 
 
+def build_fog_model_metadata(args: argparse.Namespace, dmax: float) -> str:
+    range_max = float(args.fog_range_max) if args.fog_range_max is not None else float(dmax)
+    enabled = str(args.fog_model).lower() != "none"
+    if args.fog_model == "ray_integral":
+        smoke_return = "uniform_density_ray_integral"
+        reference = "Zhang et al. 2022 gamma fog used as optional approximation"
+    elif args.fog_model == "gamma":
+        smoke_return = "zhang_style_gamma_temporal_approximation"
+        reference = "Zhang et al. 2022 gamma fog temporal model"
+    else:
+        smoke_return = "none"
+        reference = "none"
+
+    fog_model = {
+        "enabled": bool(enabled),
+        "model": str(args.fog_model),
+        "extinction_1_per_m": float(args.fog_extinction),
+        "density": float(args.fog_density),
+        "step_m": float(args.fog_step),
+        "range_max_m": range_max,
+        "gamma_k": float(args.fog_gamma_k),
+        "gamma_beta_bin": float(args.fog_gamma_beta_bin),
+        "gamma_fog_photons_per_pulse": float(args.fog_photons),
+        "surface_attenuation": "exp(-2*sigma*range)" if enabled else "none",
+        "smoke_return": smoke_return,
+        "reference": reference,
+        "pile_up_model": "not simulated by current BaseEWHSPC fast_sim capture",
+    }
+    return json.dumps(fog_model, sort_keys=True)
+
+
 def generate_one_scene(
     rgb: np.ndarray,
     depth_m: np.ndarray,
@@ -262,43 +382,99 @@ def generate_one_scene(
     nc: int = NC,
     device: str = "cpu",
     save_phi_bar: bool = False,
+    save_components: bool = False,
+    fog_model: str = "none",
+    fog_extinction: float = 0.15,
+    fog_density: float = 0.03,
+    fog_step: float = 0.05,
+    fog_range_max: Optional[float] = None,
+    fog_gamma_k: float = FOG_K,
+    fog_gamma_beta_bin: float = FOG_BETA_BIN,
+    fog_photons: float = FOG_ALPHA * PDE,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
-    """
-    生成一帧 SPAD 数据
-    """
-    # 计算最大可测距离,默认最大可测距离大约是 15 米
     dmax = 3e8 * TMAX * 1e-9 / 2
+    cfg = GEN_FOG_CONFIG
+    if cfg:
+        save_components = bool(cfg.get("save_components", save_components))
+        fog_model = str(cfg.get("fog_model", fog_model))
+        fog_extinction = float(cfg.get("fog_extinction", fog_extinction))
+        fog_density = float(cfg.get("fog_density", fog_density))
+        fog_step = float(cfg.get("fog_step", fog_step))
+        fog_range_max = cfg.get("fog_range_max", fog_range_max)
+        fog_gamma_k = float(cfg.get("fog_gamma_k", fog_gamma_k))
+        fog_gamma_beta_bin = float(cfg.get("fog_gamma_beta_bin", fog_gamma_beta_bin))
+        fog_photons = float(cfg.get("fog_photons", fog_photons))
 
-    # 缩放 RGB 和深度图,把原始 RGB 和 depth 缩放到 SPAD 输出分辨率
     rgb_r, depth_r = resize_rgb_depth(rgb, depth_m, nr=nr, nc=nc)
-    # 把深度限制在0.1 m ~ dmax,是RGB-D 数据里的深度真值
     depth_z = np.clip(depth_r, 0.1, dmax).astype(np.float32)
-    # 把沿光轴的深度转换成每个像素射线方向上的真实距离,SPAD测的是光传播距离，即斜向的真实距离，而非单纯的z-depth,表示SPAD 应该看到的距离真值
+    # z-depth 转成真实 ToF range
     gt_range = np.clip(z_depth_to_range(depth_z, fx=fx, fy=fy, cx=cx, cy=cy), 0.1, dmax).astype(np.float32)
-    # RGB 转灰度，作为反射率 albedo
+    # 把 RGB 图转成 0 到 1 的灰度图,这个灰度图在代码里被当作粗略的表面反射率
     albedo = rgb_to_gray01(rgb_r)
 
-    # 把 NumPy 数组转成 PyTorch Tensor，并放到指定设备上
+    # 转成 Torch tensor,gt_dist_t: 每个像素的真实 ToF range;albedo_t: 每个像素的反射率近似值
     gt_dist_t = torch.tensor(gt_range, device=device)
     albedo_t = torch.tensor(albedo, device=device)
 
-    # 创建瞬态信号生成器
+    # 创建瞬态响应生成器
     tr_gen = TransientGenerator(Nr=nr, Nc=nc, N_tbins=N_TBINS, tmax=TMAX, FWHM=FWHM, device=device)
-    # 生成理论瞬态响应 phi_bar，即每个像素在每个时间 bin 上期望接收到的光子数，(nr, nc, N_TBINS)
-    phi_bar = tr_gen.get_transient(
-        gt_dist=gt_dist_t,
-        albedo=albedo_t,
-        intensity=albedo_t,
-        alpha_sig=torch.tensor(ALPHA_SIG * PDE),
-        alpha_bkg=torch.tensor(ALPHA_BKG * PDE),
-    )
+    # 生成目标表面回波的形状,可以理解成：对于每个像素，根据 gt_range 把一个激光脉冲移动到对应的时间 bin 上,nr × nc × N_TBINS
+    r_t = tr_gen.get_shifted_laser_pulse_mesh(gt_dist_t)
+    albedo_mean = torch.mean(albedo_t)
+    if float(albedo_mean.detach().cpu()) <= 0.0:
+        albedo_norm = albedo_t + 1.0
+    else:
+        albedo_norm = albedo_t / albedo_mean
+    # 计算目标信号衰减
+    signal_attn = tr_gen.get_signal_attenuation(albedo_norm, gt_dist_t)
+    # 目标信号缩放系数,k_signal 控制每个像素目标回波的幅度
+    k_signal = signal_attn * float(ALPHA_SIG * PDE) / torch.mean(signal_attn)
+    # 无雾目标表面回波,表示没有雾衰减时，目标表面反射造成的期望光子时间分布
+    phi_surface_clear = torch.multiply(r_t, k_signal)
 
-    if FOG_ENABLED:
-        phi_bar = phi_bar + make_fog_phi_bar(nr, nc, device)
-    # 加入暗计数噪声
-    phi_bar = phi_bar + make_dark_phi_bar(nr, nc, device)
+    bkg_attn = albedo_norm.reshape(nr, nc, 1)
+    # 每个像素、每个时间 bin 上的背景光期望光子数
+    phi_background = bkg_attn * float(ALPHA_BKG * PDE) / float(N_TBINS)
 
-    # 创建 SPAD 传感器模拟器
+    fog_model = str(fog_model).lower()
+    if fog_model == "none":
+        phi_surface = phi_surface_clear
+        phi_smoke = torch.zeros_like(phi_surface_clear)
+    # 有雾：先计算目标表面的双程衰减
+    else:
+        # 衰减：exp(-2σr)
+        attenuation = torch.exp(-2.0 * float(fog_extinction) * gt_dist_t).reshape(nr, nc, 1)
+        # 雾中目标表面回波 phi_surface
+        phi_surface = phi_surface_clear * attenuation
+        if fog_model == "gamma":
+            phi_smoke = make_gamma_fog_phi_bar(
+                nr,
+                nc,
+                gamma_k=fog_gamma_k,
+                gamma_beta_bin=fog_gamma_beta_bin,
+                fog_photons=fog_photons,
+                device=device,
+            )
+        elif fog_model == "ray_integral":
+            # 确定烟雾积分的最远距离
+            rmax = float(fog_range_max) if fog_range_max is not None else float(dmax)
+            phi_smoke = make_ray_integral_smoke_phi_bar(
+                nr,
+                nc,
+                sigma=fog_extinction,
+                density=fog_density,
+                fog_step=fog_step,
+                range_max=rmax,
+                device=device,
+            )
+        else:
+            raise ValueError(f"unsupported fog_model: {fog_model!r}")
+
+    phi_dark = make_dark_phi_bar(nr, nc, device)
+    # phi_bar = 目标表面 + 烟雾散射 + 背景光 + 暗计数,是“每个像素、每个时间 bin 期望有多少光子”的理论均值
+    phi_bar = phi_surface + phi_smoke + phi_background + phi_dark
+
+    # 创建 SPAD 模拟器
     spc = BaseEWHSPC(
         nr,
         nc,
@@ -308,13 +484,22 @@ def generate_one_scene(
         N_ewhbins=N_TBINS,
         fast_sim=True,
     )
-    # 把理论期望光子数 phi_bar 输入 SPAD 模型，模拟真实采集
+    # 根据phi_bar期望值模拟 SPAD 的实际观测
     captured = spc.capture(phi_bar)
-    # 得到 SPAD 直方图，spad_hist是经过 SPAD 采样后的观测数据，有随机性和传感器噪声
     spad_hist = captured["ewh"].cpu().numpy().astype(np.float32)
-    # 是否保存 phi_bar，phi_bar是采样前的理论期望响应，更接近理想信号模型
     phi_bar_np = phi_bar.cpu().numpy().astype(np.float32) if save_phi_bar else None
-    # 返回模拟得到的 SPAD 时间直方图、缩放并裁剪后的 z-depth 真值、由 z-depth 转换得到的真实 ToF range、理论瞬态响应
+
+    global LAST_EXTRA_SAVE
+    LAST_EXTRA_SAVE = {}
+    if save_components:
+        LAST_EXTRA_SAVE.update({
+            "phi_surface_clear": phi_surface_clear.cpu().numpy().astype(np.float32),
+            "phi_surface": phi_surface.cpu().numpy().astype(np.float32),
+            "phi_smoke": phi_smoke.cpu().numpy().astype(np.float32),
+            "phi_background": phi_background.cpu().numpy().astype(np.float32),
+            "phi_dark": phi_dark.cpu().numpy().astype(np.float32),
+        })
+
     return spad_hist, depth_z, gt_range, phi_bar_np
 
 
@@ -358,8 +543,39 @@ def parse_args() -> argparse.Namespace:
         default="cuda" if torch.cuda.is_available() else "cpu",
         help="Torch device: cpu or cuda",
     )
+    # phi_bar是SPAD 在 capture 之前的期望时间直方图，phi_bar = phi_surface + phi_smoke + phi_background + phi_dark
     parser.add_argument("--save-phi-bar", action="store_true", help="Also save phi_bar in each .npz")
-    parser.add_argument("--fog", action="store_true", help="Add fog scattering profile")
+    # 保存 forward model 的各个组成部分,如果打开它，脚本会额外保存
+    # phi_surface_clear : 没有雾衰减前的目标表面回波;phi_surface: 加了雾双程衰减后的目标表面回波
+    # phi_smoke: 雾本身产生的散射回波;phi_background: 背景光;phi_dark: 探测器暗计数
+    parser.add_argument("--save-components", action="store_true", help="Save forward-model phi components in each .npz")
+    parser.add_argument("--fog", action="store_true", help="Legacy alias for --fog-model gamma")
+    # 雾模型开关。none:不加雾;gamma:使用 Gamma 时间分布模拟雾散射;ray_integral:沿射线积分模拟烟雾散射
+    parser.add_argument(
+        "--fog-model",
+        choices=("none", "gamma", "ray_integral"),
+        default="none",
+        help="Fog/smoke forward model",
+    )
+    # 雾的消光系数，记作 sigma 或 σ，单位是：1/m,它控制目标表面回波被雾削弱的程度
+    parser.add_argument("--fog-extinction", type=float, default=0.15, help="Fog extinction sigma in 1/m")
+    # 均匀烟雾的后向散射密度,fog_density 越大，烟雾自身产生的散射回波 phi_smoke 越强
+    parser.add_argument("--fog-density", type=float, default=0.03, help="Uniform smoke backscatter density")
+    # 沿 ray 积分时，每隔多少米采样一次
+    parser.add_argument("--fog-step", type=float, default=0.05, help="Ray-integral fog sampling step in meters")
+    # 控制 ray-integral 烟雾积分到多远
+    parser.add_argument("--fog-range-max", type=float, default=None, help="Ray-integral fog max range in meters")
+    # Gamma 雾散射模型里的形状参数 K
+    parser.add_argument("--fog-gamma-k", type=float, default=FOG_K, help="Gamma fog shape parameter K")
+    # 控制 Gamma 分布在时间 bin 方向上的衰减速度
+    parser.add_argument("--fog-gamma-beta-bin", type=float, default=FOG_BETA_BIN, help="Gamma fog beta in bin units")
+    # 控制 Gamma fog 总强度
+    parser.add_argument(
+        "--fog-photons",
+        type=float,
+        default=FOG_ALPHA * PDE,
+        help="Total expected detected fog photons per pulse for gamma fog",
+    )
     parser.add_argument("--nr", type=int, default=NR, help="Output image height")
     parser.add_argument("--nc", type=int, default=NC, help="Output image width")
     parser.add_argument("--poses-name", default="poses.txt", help="Output poses filename")
@@ -368,9 +584,23 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.fog and args.fog_model == "none":
+        args.fog_model = "gamma"
 
     global FOG_ENABLED
-    FOG_ENABLED = args.fog
+    FOG_ENABLED = args.fog_model != "none"
+    global GEN_FOG_CONFIG
+    GEN_FOG_CONFIG = {
+        "save_components": bool(args.save_components),
+        "fog_model": args.fog_model,
+        "fog_extinction": float(args.fog_extinction),
+        "fog_density": float(args.fog_density),
+        "fog_step": float(args.fog_step),
+        "fog_range_max": args.fog_range_max,
+        "fog_gamma_k": float(args.fog_gamma_k),
+        "fog_gamma_beta_bin": float(args.fog_gamma_beta_bin),
+        "fog_photons": float(args.fog_photons),
+    }
 
     in_dir = Path(args.in_dir)
     out_dir = Path(args.out)
@@ -391,6 +621,10 @@ def main() -> None:
     print(f"Input  : {in_dir} ({len(frame_keys)} frames)")
     print(f"Output : {args.nr}x{args.nc} pixels -> {out_dir}")
     print(f"ICL intrinsics scaled : fx={fx:.4f}, fy={fy:.4f}, cx={cx:.4f}, cy={cy:.4f}")
+    print(
+        f"Fog    : model={args.fog_model}, extinction={args.fog_extinction}, "
+        f"density={args.fog_density}, step={args.fog_step}"
+    )
 
     poses: List[Tuple[str, np.ndarray]] = []
     for idx, frame_key in enumerate(frame_keys, start=1):
@@ -429,9 +663,11 @@ def main() -> None:
             "gt_range": gt_range,
             "gt_depth": gt_depth_z,
             "camera_model": np.asarray(camera_model),
+            "fog_model": np.asarray(build_fog_model_metadata(args, 3e8 * TMAX * 1e-9 / 2)),
         }
         if phi_bar is not None:
             save_dict["phi_bar"] = phi_bar
+        save_dict.update(LAST_EXTRA_SAVE)
         np.savez_compressed(out_dir / f"{frame_key}.npz", **save_dict)
         poses.append((frame_key, T_wc))
         print(
