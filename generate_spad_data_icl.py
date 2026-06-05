@@ -40,9 +40,6 @@ ALPHA_SIG = 0.5
 ALPHA_BKG = 1.0
 
 FOG_ENABLED = False
-FOG_K = 0.2
-FOG_BETA_BIN = 0.01
-FOG_ALPHA = 1000
 
 DCR_CPS = 100
 
@@ -64,26 +61,6 @@ POSE_RE = re.compile(
 )
 
 
-def make_fog_phi_bar(nr: int, nc: int, device: str):
-    from scipy.stats import gamma as sp_gamma
-
-    bin_size = TMAX * 1e-9 / N_TBINS
-    beta_time = FOG_BETA_BIN / bin_size
-    t_bins = np.arange(N_TBINS) * bin_size
-    fog_pdf = sp_gamma.pdf(t_bins, a=FOG_K + 1, scale=1.0 / beta_time)
-    total = fog_pdf.sum()
-    if total > 0:
-        fog_pdf /= total
-    phi_fog = (fog_pdf * FOG_ALPHA * PDE).astype(np.float32)
-    return (
-        torch.tensor(phi_fog, device=device)
-        .unsqueeze(0)
-        .unsqueeze(0)
-        .expand(nr, nc, -1)
-        .contiguous()
-    )
-
-
 def build_gaussian_irf_1d(center_bin: float, sigma_bins: float, n_bins: int, device: str):
     x = torch.arange(n_bins, dtype=torch.float32, device=device)
     sigma = max(float(sigma_bins), 1e-6)
@@ -94,50 +71,17 @@ def build_gaussian_irf_1d(center_bin: float, sigma_bins: float, n_bins: int, dev
     return irf
 
 
-def make_gamma_fog_phi_bar(
-    nr: int,
-    nc: int,
-    gamma_k: float,
-    gamma_beta_bin: float,
-    fog_photons: float,
-    device: str,
-):
-    from scipy.stats import gamma as sp_gamma
-
-    bin_size = TMAX * 1e-9 / N_TBINS
-    beta_time = float(gamma_beta_bin) / bin_size
-    t_bins = np.arange(N_TBINS, dtype=np.float64) * bin_size
-    fog_pdf = sp_gamma.pdf(t_bins, a=float(gamma_k) + 1.0, scale=1.0 / beta_time)
-    total = fog_pdf.sum()
-    if total > 0:
-        fog_pdf /= total
-    phi_fog = (fog_pdf * float(fog_photons)).astype(np.float32)
-    return (
-        torch.tensor(phi_fog, device=device)
-        .unsqueeze(0)
-        .unsqueeze(0)
-        .expand(nr, nc, -1)
-        .contiguous()
-    )
-
-
 def make_ray_integral_smoke_phi_bar(
     nr: int,
     nc: int,
+    range_limit_m,
     sigma: float,
     density: float,
     fog_step: float,
     range_max: float,
     device: str,
 ):
-    """
-    nr, nc      图像高度和宽度
-    sigma       雾的消光系数
-    density     均匀烟雾后向散射密度
-    fog_step    沿 ray 采样的步长，单位 m
-    range_max   烟雾积分的最远距离，单位 m
-    device      cpu 或 cuda
-    """
+    """Build per-pixel smoke returns, clipped at each pixel's surface range."""
     dmax = 3e8 * TMAX * 1e-9 / 2
     step = max(float(fog_step), 1e-6)
     rmax = min(max(float(range_max), 0.0), float(dmax))
@@ -145,28 +89,29 @@ def make_ray_integral_smoke_phi_bar(
         return torch.zeros((nr, nc, N_TBINS), dtype=torch.float32, device=device)
 
     sigma_bins = FWHM / (2.355 * (TMAX / N_TBINS))
-    # 生成一条长度为 N_TBINS 的一维曲线,表示：某一个像素上的烟雾散射时间响应
-    profile = torch.zeros(N_TBINS, dtype=torch.float32, device=device)
-    # 生成沿 ray 的采样点
+    step_profiles = []
     s_values = np.arange(0.0, rmax + 0.5 * step, step, dtype=np.float64)
-    # 遍历每个烟雾采样点
     for s in s_values:
-        # 把物理距离转成 histogram 的 bin 坐标
         center_bin = (s / dmax) * N_TBINS
-        # 给该距离位置生成一个高斯脉冲
         irf = build_gaussian_irf_1d(center_bin, sigma_bins, N_TBINS, device)
-        # 计算这个烟雾采样点的权重
         weight = float(density) * math.exp(-2.0 * float(sigma) * float(s)) * step
-        # 累加到烟雾 profile
-        profile = profile + irf * float(weight)
+        step_profiles.append(irf * float(weight))
 
-    # 把一维 profile 扩展到所有像素
-    return (
-        profile.unsqueeze(0)
-        .unsqueeze(0)
-        .expand(nr, nc, -1)
-        .contiguous()
-    )
+    per_step = torch.stack(step_profiles, dim=0)
+    
+    # cum_profile[k] 表示：如果某个像素的物体距离大约是 s_k，那么这个像素前方烟雾产生的总时间回波
+    cum_profile = torch.cumsum(per_step, dim=0)
+
+    if torch.is_tensor(range_limit_m):
+        range_t = range_limit_m.to(device=device, dtype=torch.float32)
+    else:
+        range_t = torch.tensor(range_limit_m, device=device, dtype=torch.float32)
+    range_t = torch.clamp(range_t, min=0.0, max=float(rmax))
+    
+    # idx 的含义是：这个像素应该使用 cum_profile 的第几个累计结果
+    idx = torch.floor(range_t / float(step)).to(dtype=torch.long)
+    idx = torch.clamp(idx, min=0, max=cum_profile.shape[0] - 1)
+    return cum_profile[idx.reshape(-1)].reshape(nr, nc, N_TBINS).contiguous()
 
 
 def make_dark_phi_bar(nr: int, nc: int, device: str):
@@ -344,11 +289,8 @@ def build_fog_model_metadata(args: argparse.Namespace, dmax: float) -> str:
     range_max = float(args.fog_range_max) if args.fog_range_max is not None else float(dmax)
     enabled = str(args.fog_model).lower() != "none"
     if args.fog_model == "ray_integral":
-        smoke_return = "uniform_density_ray_integral"
-        reference = "Zhang et al. 2022 gamma fog used as optional approximation"
-    elif args.fog_model == "gamma":
-        smoke_return = "zhang_style_gamma_temporal_approximation"
-        reference = "Zhang et al. 2022 gamma fog temporal model"
+        smoke_return = "per_pixel_uniform_density_ray_integral"
+        reference = "Per-pixel uniform-density ray integral smoke model"
     else:
         smoke_return = "none"
         reference = "none"
@@ -360,9 +302,6 @@ def build_fog_model_metadata(args: argparse.Namespace, dmax: float) -> str:
         "density": float(args.fog_density),
         "step_m": float(args.fog_step),
         "range_max_m": range_max,
-        "gamma_k": float(args.fog_gamma_k),
-        "gamma_beta_bin": float(args.fog_gamma_beta_bin),
-        "gamma_fog_photons_per_pulse": float(args.fog_photons),
         "surface_attenuation": "exp(-2*sigma*range)" if enabled else "none",
         "smoke_return": smoke_return,
         "reference": reference,
@@ -388,9 +327,6 @@ def generate_one_scene(
     fog_density: float = 0.03,
     fog_step: float = 0.05,
     fog_range_max: Optional[float] = None,
-    fog_gamma_k: float = FOG_K,
-    fog_gamma_beta_bin: float = FOG_BETA_BIN,
-    fog_photons: float = FOG_ALPHA * PDE,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
     dmax = 3e8 * TMAX * 1e-9 / 2
     cfg = GEN_FOG_CONFIG
@@ -401,9 +337,6 @@ def generate_one_scene(
         fog_density = float(cfg.get("fog_density", fog_density))
         fog_step = float(cfg.get("fog_step", fog_step))
         fog_range_max = cfg.get("fog_range_max", fog_range_max)
-        fog_gamma_k = float(cfg.get("fog_gamma_k", fog_gamma_k))
-        fog_gamma_beta_bin = float(cfg.get("fog_gamma_beta_bin", fog_gamma_beta_bin))
-        fog_photons = float(cfg.get("fog_photons", fog_photons))
 
     rgb_r, depth_r = resize_rgb_depth(rgb, depth_m, nr=nr, nc=nc)
     depth_z = np.clip(depth_r, 0.1, dmax).astype(np.float32)
@@ -446,21 +379,13 @@ def generate_one_scene(
         attenuation = torch.exp(-2.0 * float(fog_extinction) * gt_dist_t).reshape(nr, nc, 1)
         # 雾中目标表面回波 phi_surface
         phi_surface = phi_surface_clear * attenuation
-        if fog_model == "gamma":
-            phi_smoke = make_gamma_fog_phi_bar(
-                nr,
-                nc,
-                gamma_k=fog_gamma_k,
-                gamma_beta_bin=fog_gamma_beta_bin,
-                fog_photons=fog_photons,
-                device=device,
-            )
-        elif fog_model == "ray_integral":
+        if fog_model == "ray_integral":
             # 确定烟雾积分的最远距离
             rmax = float(fog_range_max) if fog_range_max is not None else float(dmax)
             phi_smoke = make_ray_integral_smoke_phi_bar(
                 nr,
                 nc,
+                range_limit_m=gt_dist_t,
                 sigma=fog_extinction,
                 density=fog_density,
                 fog_step=fog_step,
@@ -549,11 +474,10 @@ def parse_args() -> argparse.Namespace:
     # phi_surface_clear : 没有雾衰减前的目标表面回波;phi_surface: 加了雾双程衰减后的目标表面回波
     # phi_smoke: 雾本身产生的散射回波;phi_background: 背景光;phi_dark: 探测器暗计数
     parser.add_argument("--save-components", action="store_true", help="Save forward-model phi components in each .npz")
-    parser.add_argument("--fog", action="store_true", help="Legacy alias for --fog-model gamma")
-    # 雾模型开关。none:不加雾;gamma:使用 Gamma 时间分布模拟雾散射;ray_integral:沿射线积分模拟烟雾散射
+    # 雾模型开关。none:不加雾;ray_integral:沿射线积分模拟烟雾散射
     parser.add_argument(
         "--fog-model",
-        choices=("none", "gamma", "ray_integral"),
+        choices=("none", "ray_integral"),
         default="none",
         help="Fog/smoke forward model",
     )
@@ -561,21 +485,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fog-extinction", type=float, default=0.15, help="Fog extinction sigma in 1/m")
     # 均匀烟雾的后向散射密度,fog_density 越大，烟雾自身产生的散射回波 phi_smoke 越强
     parser.add_argument("--fog-density", type=float, default=0.03, help="Uniform smoke backscatter density")
-    # 沿 ray 积分时，每隔多少米采样一次
     parser.add_argument("--fog-step", type=float, default=0.05, help="Ray-integral fog sampling step in meters")
-    # 控制 ray-integral 烟雾积分到多远
     parser.add_argument("--fog-range-max", type=float, default=None, help="Ray-integral fog max range in meters")
-    # Gamma 雾散射模型里的形状参数 K
-    parser.add_argument("--fog-gamma-k", type=float, default=FOG_K, help="Gamma fog shape parameter K")
-    # 控制 Gamma 分布在时间 bin 方向上的衰减速度
-    parser.add_argument("--fog-gamma-beta-bin", type=float, default=FOG_BETA_BIN, help="Gamma fog beta in bin units")
-    # 控制 Gamma fog 总强度
-    parser.add_argument(
-        "--fog-photons",
-        type=float,
-        default=FOG_ALPHA * PDE,
-        help="Total expected detected fog photons per pulse for gamma fog",
-    )
     parser.add_argument("--nr", type=int, default=NR, help="Output image height")
     parser.add_argument("--nc", type=int, default=NC, help="Output image width")
     parser.add_argument("--poses-name", default="poses.txt", help="Output poses filename")
@@ -584,8 +495,6 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if args.fog and args.fog_model == "none":
-        args.fog_model = "gamma"
 
     global FOG_ENABLED
     FOG_ENABLED = args.fog_model != "none"
@@ -597,9 +506,6 @@ def main() -> None:
         "fog_density": float(args.fog_density),
         "fog_step": float(args.fog_step),
         "fog_range_max": args.fog_range_max,
-        "fog_gamma_k": float(args.fog_gamma_k),
-        "fog_gamma_beta_bin": float(args.fog_gamma_beta_bin),
-        "fog_photons": float(args.fog_photons),
     }
 
     in_dir = Path(args.in_dir)
