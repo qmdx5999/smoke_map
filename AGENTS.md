@@ -6,11 +6,11 @@
 
 # 当前项目状态
 
-更新时间：2026-05-29。
+更新时间：2026-06-05。
 
 当前目录 `D:\pythonProgram\smoke_map` 是一个围绕 Single-Photon LiDAR / SPAD / TCSPC photon histogram（光子到达直方图）做三维占据建图的研究原型。核心目标是避免先把 histogram（直方图）压成单一 depth（深度）或 point cloud（点云），而是把 histogram-level uncertainty（直方图级不确定性）直接传进 occupancy mapping（占据建图）。
 
-当前主线已经完成从 ICL-NUIM 连续 RGB-D 序列生成 SPAD histogram（光子直方图）、读取多帧 `T_wc` 位姿、从 range posterior（距离后验）做 CDF-marginalized occupancy update（CDF 边缘化占据更新），并输出 surface point cloud（表面点云）、occupied voxel cloud（占据体素点云）和完整 dense log-odds grid（稠密对数几率栅格）。
+当前主线已经完成从 ICL-NUIM 连续 RGB-D 序列生成 SPAD histogram（光子直方图）、读取多帧 `T_wc` 位姿、从 range posterior（距离后验）做 CDF-marginalized occupancy update（CDF 边缘化占据更新），并输出 surface point cloud（表面点云）、occupied voxel cloud（占据体素点云）和完整 dense log-odds grid（稠密对数几率栅格）。截至 2026-06-05，仿真数据生成端 `generate_spad_data_icl.py` 已新增 per-pixel ray-integral smoke/fog forward model（逐像素射线积分烟雾/雾前向模型），但建图端 `spad_npz_occupancy_mapping.py` 仍是原来的 surface + constant background likelihood（表面 + 常数背景似然），尚未加入 smoke-aware likelihood（烟雾感知似然）。
 
 当前主要文件与目录：
 
@@ -94,7 +94,26 @@ gt_depth_z   : (256, 256), float32  # ICL z-depth（光轴深度）
 gt_range     : (256, 256), float32  # ToF/ray range（沿射线欧氏距离）
 gt_depth     : (256, 256), float32  # 兼容字段，当前等于 gt_depth_z
 camera_model : JSON metadata string
+fog_model    : JSON metadata string  # 有雾/无雾仿真模型元数据，新版生成脚本会写入
 ```
+
+如果 `generate_spad_data_icl.py` 开启 `--save-phi-bar`，还会保存：
+
+```text
+phi_bar : (256, 256, 1000), float32  # SPAD capture（采样）前的总期望响应
+```
+
+如果额外开启 `--save-components`，还会保存调试用 forward-model components（前向模型分量）：
+
+```text
+phi_surface_clear : (256, 256, 1000), float32  # 无雾衰减前的表面返回
+phi_surface       : (256, 256, 1000), float32  # 加雾双程衰减后的表面返回
+phi_smoke         : (256, 256, 1000), float32  # 烟雾/雾散射返回
+phi_background    : (256, 256, 1000), float32  # 背景光
+phi_dark          : (256, 256, 1000), float32  # 暗计数
+```
+
+这些 component（分量）只用于 debug / diagnosis（调试/诊断）和验证仿真合理性，不应作为正式 occupancy mapping（占据建图）输入，否则会把仿真真值泄漏给建图算法。
 
 `camera_model` 当前包含：
 
@@ -206,12 +225,9 @@ t_wc      = cam_pos
 
 `living_room_traj0_loop/` 是从 ICL-NUIM 的 `Living Room / traj0 loop` 解压得到的连续室内序列。它适合用于 `spad_npz_occupancy_mapping.py` 的多帧建图验证。
 
-截至 2026-05-29：
+截至 2026-06-05：
 
 - `living_room_traj0_loop/` 中有 1510 帧 RGB/depth/metadata（元数据）。
-- `out/` 中已经生成对应的 1510 个新版 SPAD `.npz` 文件和 `out/poses.txt`。
-- `out/*.npz` 已经是新版格式，包含 `camera_model`。
-- 当前 `out/` 默认没有保存 `phi_bar`，因为生成时未开启 `--save-phi-bar`。
 
 每帧原始 ICL 文件包含：
 
@@ -228,10 +244,15 @@ t_wc      = cam_pos
 - 读取 `.png` 作为 albedo / intensity（反照率 / 强度）来源。
 - 读取 `.depth` 作为 z-depth（光轴深度）。
 - 将 `z-depth` 转为 ToF/ray range（沿射线欧氏距离）：`gt_range = z * sqrt(1 + x_n^2 + y_n^2)`。
-- 使用 `gt_range` 输入 `TransientGenerator` 生成 SPAD transient（瞬态）和 histogram（直方图）。
+- 使用 `gt_range` 生成 SPAD transient（瞬态）和 histogram（直方图）。新版脚本显式拆分 forward model components（前向模型分量）：`phi_surface_clear`、`phi_surface`、`phi_smoke`、`phi_background`、`phi_dark`，并组合为 `phi_bar = phi_surface + phi_smoke + phi_background + phi_dark`。
 - 解析每帧 `.txt` 中的 `cam_pos / cam_dir / cam_up`，重建 `T_wc`。
 - 输出 `.npz` 与 `poses.txt`，命名保持 `scene_00_xxxx`。
 - `camera_model` 写入 `depth_model=z`、`tof_model=range`、`image_y_axis=up`。
+- 新增 `fog_model` JSON metadata（雾模型元数据），记录 `fog_model`、`fog_extinction`、`fog_density`、`fog_step`、`fog_range_max`、`surface_attenuation` 和 `smoke_return`。
+- 当前只保留 `--fog-model none|ray_integral`。旧 `--fog` 和 `gamma` fog（Gamma 雾模型）接口已经移除。
+- `ray_integral` 是 per-pixel uniform-density ray integral（逐像素、均匀密度射线积分）模型：每个像素的烟雾积分上限是 `min(gt_range[u,v], fog_range_max, dmax)`，因此表面后方的 smoke/fog scattering（烟雾/雾散射）不会继续贡献到该像素。
+- 有雾时表面返回使用双程衰减：`phi_surface = phi_surface_clear * exp(-2 * fog_extinction * gt_range)`。
+- 当前 `SPCSim` 的 `BaseEWHSPC(fast_sim=True)` 仍不模拟 first-photon pile-up（首光子堆积）/ dead time（死时间）畸变。
 
 生成命令：
 
@@ -243,6 +264,26 @@ D:/Anaconda3/envs/pytorch/python.exe .\generate_spad_data_icl.py --in-dir .\livi
 
 ```powershell
 --save-phi-bar
+```
+
+如果只做小规模 debug / diagnosis（调试/诊断），可以额外保存 forward-model components（前向模型分量）：
+
+```powershell
+--save-components
+```
+
+注意：`--save-components` 会显著增大 `.npz` 体积。正式多帧建图数据通常不需要开启它；后续建图代码应主要读取 `spad_hist`、`camera_model`、`fog_model` 和 `poses.txt`，不应依赖 `phi_surface` / `phi_smoke` 等仿真真值分量。
+
+生成逐像素 `ray_integral` 有雾数据的推荐命令：
+
+```powershell
+D:/Anaconda3/envs/pytorch/python.exe .\generate_spad_data_icl.py --in-dir .\living_room_traj0_loop --out out_fog_ray --fog-model ray_integral --fog-extinction 0.15 --fog-density 0.03 --fog-step 0.05
+```
+
+小规模有雾调试命令：
+
+```powershell
+D:/Anaconda3/envs/pytorch/python.exe .\generate_spad_data_icl.py --in-dir .\living_room_traj0_loop --out out_fog_ray_debug --n 10 --fog-model ray_integral --fog-extinction 0.15 --fog-density 0.03 --fog-step 0.05 --save-phi-bar --save-components
 ```
 
 当前传感器/仿真参数：
@@ -396,6 +437,9 @@ D:/Anaconda3/envs/pytorch/python.exe .\export_occupancy_from_grid.py --grid .\fu
 仍未完整实现或未验证的点：
 
 - 论文 forward model（前向模型）写的是多返回联合叠加 `lambda_b = sum_n a_n S(t_b - tau_n) + beta`；当前代码是 peak-anchored local posterior approximation（峰值锚定局部后验近似），不是联合 mixture model（混合模型）拟合。
+- 仿真端已经支持 per-pixel ray-integral smoke/fog（逐像素射线积分烟雾/雾）数据生成，但建图端 `spad_npz_occupancy_mapping.py` 还没有把 smoke/fog term（烟雾/雾项）加入 profile likelihood（剖面似然）。当前建图似然仍可概括为 `surface Gaussian pulse + constant background`（表面高斯脉冲 + 常数背景）。
+- 当前有雾仿真是 uniform-density single-scattering approximation（均匀密度单次散射近似），还不是完整 3D smoke density field（烟雾密度场）、phase function（相函数）或 multiple scattering（多次散射）模型。
+- 当前 SPAD capture（采样）仍不模拟 first-photon pile-up（首光子堆积）/ detector dead time（探测器死时间）
 - 当前只使用 Gaussian IRF（高斯系统响应），没有 measured IRF（实测系统响应）加载。
 - 没有实际计算 CRLB / Fisher information（克拉美罗下界 / 费舍尔信息）。
 - 目前有 `analyze_occupancy_grid.py` 和 `export_occupancy_from_grid.py` 这类后处理/诊断工具，但还没有真正的 benchmark evaluation（基准评测）脚本，例如 IoU、precision、recall、phantom occupied voxels（虚假占据体素）统计。
