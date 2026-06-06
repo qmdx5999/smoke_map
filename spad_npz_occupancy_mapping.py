@@ -239,6 +239,128 @@ def profile_ll_one_r_numba(h, S, eps=1e-6, max_iter=12):
 
 
 @njit(cache=True, fastmath=True)
+def profile_ll_one_r_smoke_numba(h, S, G, surface_atten, gamma, eps=1e-6, max_iter=12):
+    """
+    Smoke-aware profile likelihood（烟雾感知剖面似然）:
+    lambda = a * surface_atten * S + gamma * G + beta.
+    对于某一个固定候选距离 r，给定 surface 模板 S、smoke 模板 G，自动估计最合适的表面强度 a 和背景强度 beta
+    然后返回这个候选距离下的 Poisson log-likelihood
+    """
+    # beta:暂时用来累加所有 h[i]
+    beta = 0.0
+    
+    # hmax:记录观测 histogram 的最大值
+    hmax = 0.0
+    
+    # gmax:记录 smoke template G 的最大值
+    gmax = 0.0
+    gam = max(gamma, 0.0)
+    
+    # 对当前窗口内的所有 bin 遍历
+    for i in range(h.size):
+        # 累加所有 bin 的观测值
+        beta += h[i]
+        
+        # 记录观测 histogram 的最大值
+        if h[i] > hmax:
+            hmax = h[i]
+        
+        # 记录 smoke template 的最大值
+        if G[i] > gmax:
+            gmax = G[i]
+    
+    # 估计背景 beta:当前 histogram 窗口的平均 photon count - 最大 smoke contribution = 每个 bin 都有的常数底噪
+    beta = max(beta / max(1, h.size) - gam * gmax, 0.0)
+
+    surf = max(surface_atten, 0.0)
+    
+    # 计算衰减后的 surface 模板的最大值
+    smax = 0.0
+    for i in range(S.size):
+        v = surf * S[i]
+        if v > smax:
+            smax = v
+
+    # 如果 surface 项无效，函数就不再进入后面的 Newton 优化，而是直接返回一个退化模型的似然值
+    # 即当前观测 histogram h 在 smoke + background 模型下的 Poisson log-likelihood
+    if smax <= 0.0:
+        lam_bg = np.empty_like(h)
+        for i in range(h.size):
+            lam_bg[i] = max(gam * G[i] + beta, eps)
+        return poisson_ll_numba(h, lam_bg)
+
+    # hmax ≈ a · smax + gam · gmax + beta即观测最高值 ≈ 表面峰贡献 + smoke 最大贡献 + 背景
+    # 那么a ≈ (hmax - beta - gam · gmax) / smax得到表面强度 a 的初始值
+    a = max(hmax - beta - gam * gmax, 0.0) / max(smax, 1e-12)
+    
+    # lam 用来存模型预测的每个 bin 的 Poisson 均值
+    lam = np.empty_like(h)
+    for _ in range(max_iter):
+        # 用当前 a 和 beta 构造预测值 λ_i
+        for i in range(h.size):
+            lam[i] = max(a * surf * S[i] + gam * G[i] + beta, eps)
+
+        # 初始化梯度,g_a = ∂L / ∂a,g_b = ∂L / ∂beta
+        g_a = 0.0
+        g_b = 0.0
+        for i in range(h.size):
+            inv = h[i] / lam[i] - 1.0
+            Si = surf * S[i]
+            g_a += Si * inv
+            g_b += inv
+        
+        # 两个参数的梯度都很小,继续调整 a 和 beta，likelihood 已经几乎不会提升,所以提前停止迭代
+        if abs(g_a) + abs(g_b) < 1e-6:
+            break
+
+        H_aa = 0.0
+        H_ab = 0.0
+        H_bb = 0.0
+        for i in range(h.size):
+            Si = surf * S[i]
+            w = h[i] / (lam[i] * lam[i])
+            H_aa += -(Si * Si) * w
+            H_ab += -Si * w
+            H_bb += -w
+
+        det = H_aa * H_bb - H_ab * H_ab
+        if (not math.isfinite(det)) or abs(det) < 1e-18:
+            break
+
+        delta_a = (H_bb * g_a - H_ab * g_b) / det
+        delta_b = (-H_ab * g_a + H_aa * g_b) / det
+        base_ll = poisson_ll_numba(h, lam)
+
+        step = 1.0
+        ok = False
+        for __ in range(10):
+            a_new = a - step * delta_a
+            b_new = beta - step * delta_b
+            if a_new < 0.0:
+                a_new = 0.0
+            if b_new < 0.0:
+                b_new = 0.0
+            for i in range(h.size):
+                lam[i] = max(a_new * surf * S[i] + gam * G[i] + b_new, eps)
+            ll_new = poisson_ll_numba(h, lam)
+            if math.isfinite(ll_new) and ll_new >= base_ll - 1e-10:
+                a = a_new
+                beta = b_new
+                ok = True
+                break
+            step *= 0.5
+        if not ok:
+            break
+
+    # 用最终优化出来的 a 和 beta 重新计算一次模型预测
+    for i in range(h.size):
+        lam[i] = max(a * surf * S[i] + gam * G[i] + beta, eps)
+    
+    # 返回当前候选距离 r 下，最优 a 和 beta 对应的 Poisson log-likelihood,返回的是观测 histogram h 在模型预测 lam 下的 Poisson 对数似然
+    return poisson_ll_numba(h, lam)
+
+
+@njit(cache=True, fastmath=True)
 def build_S_gaussian(idx0, idx1, rbin, sigma_bins):
     """
     给定一个候选距离rbin，生成一个和直方图窗口一样长的高斯脉冲模板，模拟如果墙正好在rbin这个距离，我们应该看到的光子分布形状
@@ -254,6 +376,69 @@ def build_S_gaussian(idx0, idx1, rbin, sigma_bins):
         S[i] = math.exp(-0.5 * (delta / s) * (delta / s))
     
     return S  # 返回生成的高斯模板数组
+
+
+def build_smoke_integral_templates(
+    n_bins: int,
+    bin_to_m: float,
+    sigma_bins: float,
+    kappa: float,
+    fog_step_m: float,
+    range_max_m: float,
+) -> Tuple[np.ndarray, float]:
+    """
+    Precompute unit-density G(r; kappa) for the smoke-aware likelihood.
+
+    The caller multiplies the selected row by gamma=density.
+    预计算单位烟雾密度下,从传感器到不同距离为止，烟雾沿途散射会在 SPAD histogram 中形成什么形状的查表数组
+    """
+    step_m = max(float(fog_step_m), 1e-6)
+    dmax = float(n_bins) * float(bin_to_m)
+    
+    # rmax = min(用户指定的最大距离, histogram 最大距离)
+    rmax = min(max(float(range_max_m), 0.0), dmax)
+    if rmax <= 0.0:
+        return np.zeros((1, n_bins), dtype=np.float64), step_m
+
+    # 计算需要多少个距离采样点,这里决定要构造多少个距离模板
+    n_steps = int(math.floor(rmax / step_m)) + 1
+    
+    # 初始化模板数组,那么templates[j, :]会是一条完整的 histogram 模板
+    templates = np.zeros((n_steps, n_bins), dtype=np.float64)
+    
+    # 构造 bin 坐标,后面用它来生成高斯脉冲
+    x = np.arange(n_bins, dtype=np.float64)
+    
+    # impulse response function 的标准差，单位是 bin
+    sigma = max(float(sigma_bins), 1e-6)
+    kap = max(float(kappa), 0.0)
+    
+    # 每一个 j 对应一个烟雾散射位置
+    for j in range(n_steps):
+        # s_m 表示沿 ray 距离传感器 s 米的位置有一小段烟雾，它会产生一部分散射光
+        s_m = float(j) * step_m
+        
+        # 把距离 s_m 转成 bin 位置
+        center_bin = s_m / max(float(bin_to_m), 1e-12)
+        
+        # 构造这个距离处的 IRF 高斯脉冲,生成一个以 center_bin 为中心的高斯峰
+        irf = np.exp(-0.5 * ((x - center_bin) / sigma) ** 2)
+        total = float(irf.sum())
+        if total > 0.0:
+            irf /= total
+        
+        # 计算这一小段烟雾的散射权重
+        weight = math.exp(-2.0 * kap * s_m) * step_m
+        
+        # 对于每个距离 j，不是只保存该距离一小段烟雾的贡献，而是保存从 0 到 j * step_m 之间所有烟雾散射贡献的累计结果
+        if j == 0:
+            templates[j, :] = irf * weight
+        else:
+            templates[j, :] = templates[j - 1, :] + irf * weight
+    
+    # templates[j, :] 表示从传感器到距离 j * step_m 之间所有烟雾散射贡献的累计 histogram
+    # 给定一条 ray，如果从相机到距离 r 之间都有均匀烟雾，那么这些烟雾会在 SPAD histogram 上形成一个前向散射背景,templates[j, :] 就是这个背景的形状
+    return templates, step_m
 
 
 @njit(cache=True, fastmath=True)
@@ -324,6 +509,119 @@ def compute_ll_grid_numba(h, peak_bin, Wr_bin, M, win_half, sigma_bins, tau, bin
         r_grid_m[i] = (r0 + step * i) * bin_to_m  # 每个候选距离的 bin 索引rb = r0 + step * i，乘以转换系数bin_to_m，转换成了以米为单位的实际距离
     
     # r_grid_m:候选距离网格（米）,提供每个候选距离的实际位置;cdf:后验累积分布函数;p:后验概率分布
+    return r_grid_m, cdf, p
+
+
+@njit(cache=True, fastmath=True)
+def compute_ll_grid_smoke_numba(
+    h,
+    peak_bin,
+    Wr_bin,
+    M,
+    win_half,
+    sigma_bins,
+    tau,
+    bin_to_m,
+    kappa,
+    gamma,
+    smoke_templates,
+    smoke_step_m,
+):
+    """
+    Smoke-aware range posterior（烟雾感知距离后验） using a prefix window.
+    Candidate r stays near peak_bin, while likelihood uses bins [0, peak_bin+win_half].
+    """
+    B = h.size
+    b0 = 0
+    b1 = peak_bin + win_half + 1
+    if b1 > B:
+        b1 = B
+    if b1 <= b0:
+        b1 = B
+
+    # 复制窗口内的观测 histogram
+    nwin = b1 - b0
+    h_w = np.empty(nwin, dtype=np.float64)
+    for i in range(nwin):
+        h_w[i] = h[i]
+
+    # 初始化 likelihood 数组,ll[k] 用来存第 k 个候选距离的 log-likelihood
+    ll = np.empty(M, dtype=np.float64)
+    r0 = peak_bin - Wr_bin
+    r1 = peak_bin + Wr_bin
+    step = 0.0 if M == 1 else (r1 - r0) / (M - 1)
+
+    # 遍历每个候选距离
+    for k in range(M):
+        # rb 是当前候选表面位置，单位是 bin
+        rb = r0 + step * k
+        
+        # 把 bin 位置转换成实际距离，单位是米
+        r_m = rb * bin_to_m
+        
+        # 构造当前候选距离对应的 surface 模板,表示如果表面在 rb 这个 bin，那么表面反射在当前窗口 [b0, b1) 内应该长什么样
+        S = build_S_gaussian(b0, b1, rb, sigma_bins)
+        
+        # 把当前候选表面距离 r_m 映射到 smoke template 的行号
+        row = int(math.floor(max(r_m, 0.0) / max(smoke_step_m, 1e-12)))
+        if row < 0:
+            row = 0
+        if row >= smoke_templates.shape[0]:
+            row = smoke_templates.shape[0] - 1
+        
+        # 取出当前候选距离下的 smoke 模板,表示如果表面距离是 r_m，那么从 0 到 r_m 的烟雾散射，在当前观测窗口内形成的 histogram 形状
+        G = np.empty(nwin, dtype=np.float64)
+        for i in range(nwin):
+            G[i] = smoke_templates[row, i]
+        
+        # 计算表面反射的衰减
+        surface_atten = math.exp(-2.0 * max(kappa, 0.0) * max(r_m, 0.0))
+        
+        # 计算当前候选距离的 log-likelihood,在候选距离 rb 下，当前 histogram 被 smoke-aware model 解释得有多好,数值越大，这个候选距离越可能
+        # ll[i] = log p(h | r_i),意思是如果真实表面距离是第 i 个候选距离 r_i，那么观测到当前 SPAD histogram h 的可能性有多大
+        ll[k] = profile_ll_one_r_smoke_numba(h_w, S, G, surface_atten, gamma)
+
+    t = max(tau, 1e-6)
+    
+    # 找到最大的 ll[i] / t
+    m = ll[0] / t
+    for i in range(1, M):
+        v = ll[i] / t
+        if v > m:
+            m = v
+
+    # 初始化 posterior 数组,p[i]表示第 i 个候选距离的概率
+    p = np.empty(M, dtype=np.float64)
+    s = 0.0
+    
+    # 把 log-likelihood 转换成未归一化概率
+    for i in range(M):
+        v = math.exp(ll[i] / t - m)
+        p[i] = v
+        s += v
+    
+    # 归一化成真正的概率分布
+    if s <= 0.0:
+        for i in range(M):
+            p[i] = 1.0 / M
+    else:
+        for i in range(M):
+            p[i] /= s
+
+    # 把概率分布 p 转换成累计分布 cdf
+    cdf = np.empty(M, dtype=np.float64)
+    acc = 0.0
+    for i in range(M):
+        acc += p[i]
+        cdf[i] = acc
+
+    # 构造候选距离网格，单位是米
+    r_grid_m = np.empty(M, dtype=np.float64)
+    for i in range(M):
+        # r_grid_m[i]表示第 i 个候选距离的实际 range
+        r_grid_m[i] = (r0 + step * i) * bin_to_m
+    
+    # 候选距离网格，单位是米;后验概率的累计分布;每个候选距离的后验概率
     return r_grid_m, cdf, p
 
 
@@ -703,7 +1001,7 @@ def _decode_npz_scalar(value: np.ndarray) -> str:
 
 
 def load_spad_frame_npz(path: Path) -> Tuple[np.ndarray, Dict[str, object]]:
-    """Load spad_hist and optional camera_model metadata from one .npz frame."""
+    """Load spad_hist plus optional camera_model/fog_model metadata from one .npz frame."""
     with np.load(path) as data:
         if "spad_hist" not in data:
             raise KeyError(f"{path} does not contain a 'spad_hist' array")
@@ -718,6 +1016,15 @@ def load_spad_frame_npz(path: Path) -> Tuple[np.ndarray, Dict[str, object]]:
             if not isinstance(parsed, dict):
                 raise ValueError(f"{path}: camera_model must decode to a JSON object")
             metadata = parsed
+        if "fog_model" in data:
+            raw = _decode_npz_scalar(np.asarray(data["fog_model"]))
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{path}: invalid fog_model JSON: {exc}") from exc
+            if not isinstance(parsed, dict):
+                raise ValueError(f"{path}: fog_model must decode to a JSON object")
+            metadata["fog_model"] = parsed
     if spad_hist.ndim != 3:
         raise ValueError(f"{path}: spad_hist must have shape (H, W, T), got {spad_hist.shape}")
     return spad_hist, metadata
@@ -819,6 +1126,49 @@ def metadata_float(metadata: Dict[str, object], key: str, default: Optional[floa
     if not math.isfinite(value):
         raise ValueError(f"camera_model.{key} must be finite, got {value!r}")
     return value
+
+
+def resolve_likelihood_model(args: argparse.Namespace, metadata: Dict[str, object]) -> Tuple[str, float, float, float]:
+    """
+    根据命令行参数 --likelihood-model 和当前帧 metadata 里的 fog_model，决定使用 clear 还是 smoke likelihood，并返回烟雾模型参数
+    输出likelihood_model, kappa消光系数, gamma烟雾体散射项的强度系数, step_m积分步长
+    """
+    fog = metadata.get("fog_model")
+    if fog is None:
+        fog = {}
+    if not isinstance(fog, dict):
+        raise ValueError("fog_model metadata must be a JSON object when present")
+
+    enabled = bool(fog.get("enabled", False))
+    fog_kind = str(fog.get("model", "none")).lower()
+    has_ray_integral = enabled and fog_kind == "ray_integral"
+    choice = str(args.likelihood_model).lower()
+
+    if choice == "clear":
+        return "clear", 0.0, 0.0, 0.05
+    if choice == "auto" and not has_ray_integral:
+        return "clear", 0.0, 0.0, 0.05
+    if choice not in ("auto", "smoke"):
+        raise ValueError(f"unsupported likelihood_model: {choice!r}")
+    if not has_ray_integral:
+        raise ValueError(
+            "--likelihood-model smoke requires fog_model.enabled=true and fog_model.model='ray_integral'"
+        )
+
+    try:
+        kappa = float(fog["extinction_1_per_m"])
+        gamma = float(fog["density"])
+        step_m = float(fog.get("step_m", 0.05))
+    except KeyError as exc:
+        raise ValueError(f"fog_model is missing required field {exc.args[0]!r}") from exc
+    except (TypeError, ValueError) as exc:
+        raise ValueError("fog_model extinction_1_per_m, density, and step_m must be numeric") from exc
+
+    if not (math.isfinite(kappa) and math.isfinite(gamma) and math.isfinite(step_m)):
+        raise ValueError("fog_model smoke parameters must be finite")
+    if kappa < 0.0 or gamma < 0.0 or step_m <= 0.0:
+        raise ValueError("fog_model requires kappa>=0, density>=0, and step_m>0")
+    return "smoke", kappa, gamma, step_m
 
 
 def resolve_image_y_axis(args: argparse.Namespace, metadata: Dict[str, object]) -> str:
@@ -952,6 +1302,25 @@ def process_frame(
     bin_to_m = C_M_PER_S * (args.tmax_ns * 1e-9) / 2.0 / float(B)
     print(f"[{frame_key}] spad_hist shape={spad_hist.shape}, dtype={spad_hist.dtype}")
     print(f"[{frame_key}] bin_to_m={bin_to_m:.8f} m/bin, tmax={args.tmax_ns:g} ns")
+    
+    # 从当前帧的 metadata 中解析烟雾模型设置，并结合命令行参数决定这帧用 clear 还是 smoke；如果用 smoke，就取出烟雾消光系数、烟雾密度和积分步长
+    likelihood_model, fog_kappa, fog_gamma, fog_step_m = resolve_likelihood_model(args, frame_metadata)
+    smoke_templates = np.zeros((1, B), dtype=np.float64)
+    smoke_step_used = max(float(fog_step_m), 1e-6)
+    if likelihood_model == "smoke":
+        # smoke_templates 保存烟雾散射模板表；smoke_step_used 保存这个模板表对应的距离步长
+        smoke_templates, smoke_step_used = build_smoke_integral_templates(
+            n_bins=B,
+            bin_to_m=float(bin_to_m),
+            sigma_bins=float(args.sigma_bins),
+            kappa=float(fog_kappa),
+            fog_step_m=float(fog_step_m),
+            range_max_m=float(args.range_max),
+        )
+    print(
+        f"[{frame_key}] likelihood_model={likelihood_model} "
+        f"kappa={fog_kappa:.6g} gamma={fog_gamma:.6g} smoke_step={smoke_step_used:.6g}"
+    )
 
     # 最终 fx, fy, cx, cy 的来源优先级是
     # 第 1 优先级：命令行参数
@@ -1088,16 +1457,32 @@ def process_frame(
         for pk, pk_score in zip(peaks, peak_scores):
             _tp = time.perf_counter()
             # 计算距离后验
-            r_grid_m, _, pdf_grid = compute_ll_grid_numba(
-                h,
-                int(pk),
-                int(args.Wr_bin),
-                int(args.M),
-                int(args.win_half),
-                float(args.sigma_bins),
-                float(args.tau),
-                float(bin_to_m),
-            )
+            if likelihood_model == "smoke":
+                r_grid_m, _, pdf_grid = compute_ll_grid_smoke_numba(
+                    h,
+                    int(pk),
+                    int(args.Wr_bin),
+                    int(args.M),
+                    int(args.win_half),
+                    float(args.sigma_bins),
+                    float(args.tau),
+                    float(bin_to_m),
+                    float(fog_kappa),
+                    float(fog_gamma),
+                    smoke_templates,
+                    float(smoke_step_used),
+                )
+            else:
+                r_grid_m, _, pdf_grid = compute_ll_grid_numba(
+                    h,
+                    int(pk),
+                    int(args.Wr_bin),
+                    int(args.M),
+                    int(args.win_half),
+                    float(args.sigma_bins),
+                    float(args.tau),
+                    float(bin_to_m),
+                )
             t_posterior += time.perf_counter() - _tp
             posterior_evals += 1
             peak_weight = max(float(pk_score), 0.0) / total_peak_score
@@ -1237,6 +1622,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--tau", type=float, default=1.0)
     ap.add_argument("--win_half", type=int, default=25)
     ap.add_argument("--sigma_bins", type=float, default=2.0)
+    ap.add_argument(
+        "--likelihood-model",
+        choices=["auto", "clear", "smoke"],
+        default="auto",
+        help="Histogram likelihood model: auto uses fog_model ray_integral metadata when present.",
+    )
     ap.add_argument("--range_model", choices=["range", "z"], default="range")
     ap.add_argument("--max_peaks", type=int, default=2)
     ap.add_argument("--mp_thr", type=float, default=10.0)
