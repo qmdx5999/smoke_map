@@ -239,125 +239,139 @@ def profile_ll_one_r_numba(h, S, eps=1e-6, max_iter=12):
 
 
 @njit(cache=True, fastmath=True)
-def profile_ll_one_r_smoke_numba(h, S, G, surface_atten, gamma, eps=1e-6, max_iter=12):
+def fit_profile_one_r_smoke_count_numba(h, S, G, smoke_scale, eps=1e-6, max_iter=12):
     """
-    Smoke-aware profile likelihood（烟雾感知剖面似然）:
-    lambda = a * surface_atten * S + gamma * G + beta.
-    对于某一个固定候选距离 r，给定 surface 模板 S、smoke 模板 G，自动估计最合适的表面强度 a 和背景强度 beta
-    然后返回这个候选距离下的 Poisson log-likelihood
+    拟合累计计数域模型:
+    lambda = alpha * S + smoke_scale * G + beta.
+
+    alpha 是包含表面衰减的有效表面计数幅度
+    smoke_scale 等于 n_pulses * gamma
+    只对非负 alpha 和 beta 做 profile optimization（剖面优化）
+
+    h[i]	第 i 个 time bin 观测到的 photon count
+    S[i]	假设表面在当前候选距离 r 时，表面回波的高斯模板
+    G[i]	假设表面在当前候选距离 r 时，0 到 r 之间烟雾散射形成的模板
+    smoke_scale	烟雾强度尺度，通常是 n_pulses * gamma
+    alpha	表面回波的有效幅度，已经包含烟雾衰减后的结果
+    beta	每个 bin 的常数背景项
+    λ[i]	模型预测第 i 个 bin 应该有多少 photon count
     """
-    # beta:暂时用来累加所有 h[i]
+    # beta:临时用来累加观测总 photon count
     beta = 0.0
     
-    # hmax:记录观测 histogram 的最大值
+    # smoke_sum:烟雾模板的总 photon count
+    smoke_sum = 0.0
+    
+    # hmax:观测 histogram 的最大值
     hmax = 0.0
     
-    # gmax:记录 smoke template G 的最大值
-    gmax = 0.0
-    gam = max(gamma, 0.0)
+    # smoke_max:烟雾项在所有 bin 里的最大值
+    smoke_max = 0.0
     
-    # 对当前窗口内的所有 bin 遍历
+    # scale:非负烟雾尺度
+    scale = max(smoke_scale, 0.0)
     for i in range(h.size):
-        # 累加所有 bin 的观测值
+        # 累加观测总光子数
         beta += h[i]
         
-        # 记录观测 histogram 的最大值
+        # 记录观测峰值
         if h[i] > hmax:
             hmax = h[i]
         
-        # 记录 smoke template 的最大值
-        if G[i] > gmax:
-            gmax = G[i]
+        # smoke_i 是第 i 个 bin 里，模型认为烟雾会贡献多少 photon count
+        smoke_i = scale * G[i]
+        
+        # 统计烟雾总量
+        smoke_sum += smoke_i
+        
+        # 记录烟雾峰值
+        if smoke_i > smoke_max:
+            smoke_max = smoke_i
     
-    # 估计背景 beta:当前 histogram 窗口的平均 photon count - 最大 smoke contribution = 每个 bin 都有的常数底噪
-    beta = max(beta / max(1, h.size) - gam * gmax, 0.0)
+    # 观测总光子数 ≈ 表面总光子数 + 烟雾总光子数 + 背景总光子数,粗略估计beta ≈ (观测总光子数 - 烟雾总光子数) / bin数量
+    beta = max((beta - smoke_sum) / max(1, h.size), 0.0)
 
-    surf = max(surface_atten, 0.0)
-    
-    # 计算衰减后的 surface 模板的最大值
+    # 找 surface 模板的最大值
     smax = 0.0
     for i in range(S.size):
-        v = surf * S[i]
-        if v > smax:
-            smax = v
+        if S[i] > smax:
+            smax = S[i]
 
-    # 如果 surface 项无效，函数就不再进入后面的 Newton 优化，而是直接返回一个退化模型的似然值
-    # 即当前观测 histogram h 在 smoke + background 模型下的 Poisson log-likelihood
+    # 如果 surface 模板无效,只用烟雾散射 + 背景
     if smax <= 0.0:
         lam_bg = np.empty_like(h)
         for i in range(h.size):
-            lam_bg[i] = max(gam * G[i] + beta, eps)
-        return poisson_ll_numba(h, lam_bg)
+            lam_bg[i] = max(scale * G[i] + beta, eps)
+        
+        # ll:当前退化模型的 Poisson log-likelihood;alpha:0.0，因为没有 surface 项;beta:当前估计的背景
+        return poisson_ll_numba(h, lam_bg), 0.0, beta
 
-    # hmax ≈ a · smax + gam · gmax + beta即观测最高值 ≈ 表面峰贡献 + smoke 最大贡献 + 背景
-    # 那么a ≈ (hmax - beta - gam · gmax) / smax得到表面强度 a 的初始值
-    a = max(hmax - beta - gam * gmax, 0.0) / max(smax, 1e-12)
+    # hmax ≈ alpha * smax + smoke_max + beta,alpha ≈ (hmax - smoke_max - beta) / smax
+    alpha = max(hmax - beta - smoke_max, 0.0) / max(smax, 1e-12)
     
-    # lam 用来存模型预测的每个 bin 的 Poisson 均值
+    # 创建预测 histogram 数组
     lam = np.empty_like(h)
     for _ in range(max_iter):
-        # 用当前 a 和 beta 构造预测值 λ_i
         for i in range(h.size):
-            lam[i] = max(a * surf * S[i] + gam * G[i] + beta, eps)
+            lam[i] = max(alpha * S[i] + scale * G[i] + beta, eps)
 
-        # 初始化梯度,g_a = ∂L / ∂a,g_b = ∂L / ∂beta
-        g_a = 0.0
-        g_b = 0.0
+        g_alpha = 0.0
+        g_beta = 0.0
         for i in range(h.size):
             inv = h[i] / lam[i] - 1.0
-            Si = surf * S[i]
-            g_a += Si * inv
-            g_b += inv
-        
-        # 两个参数的梯度都很小,继续调整 a 和 beta，likelihood 已经几乎不会提升,所以提前停止迭代
-        if abs(g_a) + abs(g_b) < 1e-6:
+            g_alpha += S[i] * inv
+            g_beta += inv
+        if abs(g_alpha) + abs(g_beta) < 1e-6:
             break
 
         H_aa = 0.0
         H_ab = 0.0
         H_bb = 0.0
         for i in range(h.size):
-            Si = surf * S[i]
             w = h[i] / (lam[i] * lam[i])
-            H_aa += -(Si * Si) * w
-            H_ab += -Si * w
+            H_aa += -(S[i] * S[i]) * w
+            H_ab += -S[i] * w
             H_bb += -w
 
         det = H_aa * H_bb - H_ab * H_ab
         if (not math.isfinite(det)) or abs(det) < 1e-18:
             break
 
-        delta_a = (H_bb * g_a - H_ab * g_b) / det
-        delta_b = (-H_ab * g_a + H_aa * g_b) / det
+        delta_alpha = (H_bb * g_alpha - H_ab * g_beta) / det
+        delta_beta = (-H_ab * g_alpha + H_aa * g_beta) / det
         base_ll = poisson_ll_numba(h, lam)
 
         step = 1.0
         ok = False
         for __ in range(10):
-            a_new = a - step * delta_a
-            b_new = beta - step * delta_b
-            if a_new < 0.0:
-                a_new = 0.0
-            if b_new < 0.0:
-                b_new = 0.0
+            alpha_new = max(alpha - step * delta_alpha, 0.0)
+            beta_new = max(beta - step * delta_beta, 0.0)
             for i in range(h.size):
-                lam[i] = max(a_new * surf * S[i] + gam * G[i] + b_new, eps)
+                lam[i] = max(alpha_new * S[i] + scale * G[i] + beta_new, eps)
             ll_new = poisson_ll_numba(h, lam)
             if math.isfinite(ll_new) and ll_new >= base_ll - 1e-10:
-                a = a_new
-                beta = b_new
+                alpha = alpha_new
+                beta = beta_new
                 ok = True
                 break
             step *= 0.5
         if not ok:
             break
 
-    # 用最终优化出来的 a 和 beta 重新计算一次模型预测
     for i in range(h.size):
-        lam[i] = max(a * surf * S[i] + gam * G[i] + beta, eps)
+        lam[i] = max(alpha * S[i] + scale * G[i] + beta, eps)
     
-    # 返回当前候选距离 r 下，最优 a 和 beta 对应的 Poisson log-likelihood,返回的是观测 histogram h 在模型预测 lam 下的 Poisson 对数似然
-    return poisson_ll_numba(h, lam)
+    # poisson_ll_numba(h, lam)就是在问如果模型预测是 lam，那么观测到 h 的可能性有多大
+    # 返回的是 Poisson log-likelihood，数值越大，说明当前候选距离 r 越能解释这个像素的 SPAD histogram
+    # alpha 是拟合出来的表面回波强度,不是原始反射率，而是已经包含烟雾衰减后的有效表面 photon count 幅度
+    # beta 是拟合出来的常数背景强度
+    return poisson_ll_numba(h, lam), alpha, beta
+
+
+@njit(cache=True, fastmath=True)
+def profile_ll_one_r_smoke_count_numba(h, S, G, smoke_scale, eps=1e-6, max_iter=12):
+    ll, _, _ = fit_profile_one_r_smoke_count_numba(h, S, G, smoke_scale, eps, max_iter)
+    return ll
 
 
 @njit(cache=True, fastmath=True)
@@ -522,8 +536,8 @@ def compute_ll_grid_smoke_numba(
     sigma_bins,
     tau,
     bin_to_m,
-    kappa,
     gamma,
+    n_pulses,
     smoke_templates,
     smoke_step_m,
 ):
@@ -574,12 +588,10 @@ def compute_ll_grid_smoke_numba(
         for i in range(nwin):
             G[i] = smoke_templates[row, i]
         
-        # 计算表面反射的衰减
-        surface_atten = math.exp(-2.0 * max(kappa, 0.0) * max(r_m, 0.0))
-        
         # 计算当前候选距离的 log-likelihood,在候选距离 rb 下，当前 histogram 被 smoke-aware model 解释得有多好,数值越大，这个候选距离越可能
         # ll[i] = log p(h | r_i),意思是如果真实表面距离是第 i 个候选距离 r_i，那么观测到当前 SPAD histogram h 的可能性有多大
-        ll[k] = profile_ll_one_r_smoke_numba(h_w, S, G, surface_atten, gamma)
+        smoke_scale = max(n_pulses, 0.0) * max(gamma, 0.0)
+        ll[k] = profile_ll_one_r_smoke_count_numba(h_w, S, G, smoke_scale)
 
     t = max(tau, 1e-6)
     
@@ -1001,7 +1013,7 @@ def _decode_npz_scalar(value: np.ndarray) -> str:
 
 
 def load_spad_frame_npz(path: Path) -> Tuple[np.ndarray, Dict[str, object]]:
-    """Load spad_hist plus optional camera_model/fog_model metadata from one .npz frame."""
+    """Load spad_hist plus optional camera/fog/capture metadata from one .npz frame."""
     with np.load(path) as data:
         if "spad_hist" not in data:
             raise KeyError(f"{path} does not contain a 'spad_hist' array")
@@ -1025,6 +1037,15 @@ def load_spad_frame_npz(path: Path) -> Tuple[np.ndarray, Dict[str, object]]:
             if not isinstance(parsed, dict):
                 raise ValueError(f"{path}: fog_model must decode to a JSON object")
             metadata["fog_model"] = parsed
+        if "capture_model" in data:
+            raw = _decode_npz_scalar(np.asarray(data["capture_model"]))
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{path}: invalid capture_model JSON: {exc}") from exc
+            if not isinstance(parsed, dict):
+                raise ValueError(f"{path}: capture_model must decode to a JSON object")
+            metadata["capture_model"] = parsed
     if spad_hist.ndim != 3:
         raise ValueError(f"{path}: spad_hist must have shape (H, W, T), got {spad_hist.shape}")
     return spad_hist, metadata
@@ -1171,6 +1192,28 @@ def resolve_likelihood_model(args: argparse.Namespace, metadata: Dict[str, objec
     return "smoke", kappa, gamma, step_m
 
 
+def resolve_n_pulses(args: argparse.Namespace, metadata: Dict[str, object], likelihood_model: str) -> Optional[int]:
+    """Resolve pulse count with CLI taking precedence over capture_model metadata."""
+    if args.n_pulses is not None:
+        n_pulses = int(args.n_pulses)
+    else:
+        capture = metadata.get("capture_model")
+        if capture is None:
+            capture = {}
+        if not isinstance(capture, dict):
+            raise ValueError("capture_model metadata must be a JSON object when present")
+        raw = capture.get("n_pulses")
+        n_pulses = None if raw is None else int(raw)
+
+    if n_pulses is not None and n_pulses <= 0:
+        raise ValueError("n_pulses must be a positive integer")
+    if likelihood_model == "smoke" and n_pulses is None:
+        raise ValueError(
+            "smoke likelihood requires pulse count; pass --n-pulses or use data with capture_model.n_pulses"
+        )
+    return n_pulses
+
+
 def resolve_image_y_axis(args: argparse.Namespace, metadata: Dict[str, object]) -> str:
     """决定当前帧图像 y 轴方向，优先使用命令行参数；如果命令行是 auto，就从 metadata 里读取；如果 metadata 也没有，就默认用 down"""
     choice = str(args.image_y_axis).lower()
@@ -1305,6 +1348,7 @@ def process_frame(
     
     # 从当前帧的 metadata 中解析烟雾模型设置，并结合命令行参数决定这帧用 clear 还是 smoke；如果用 smoke，就取出烟雾消光系数、烟雾密度和积分步长
     likelihood_model, fog_kappa, fog_gamma, fog_step_m = resolve_likelihood_model(args, frame_metadata)
+    n_pulses = resolve_n_pulses(args, frame_metadata, likelihood_model)
     smoke_templates = np.zeros((1, B), dtype=np.float64)
     smoke_step_used = max(float(fog_step_m), 1e-6)
     if likelihood_model == "smoke":
@@ -1319,6 +1363,7 @@ def process_frame(
         )
     print(
         f"[{frame_key}] likelihood_model={likelihood_model} "
+        f"n_pulses={n_pulses if n_pulses is not None else 'n/a'} "
         f"kappa={fog_kappa:.6g} gamma={fog_gamma:.6g} smoke_step={smoke_step_used:.6g}"
     )
 
@@ -1467,8 +1512,8 @@ def process_frame(
                     float(args.sigma_bins),
                     float(args.tau),
                     float(bin_to_m),
-                    float(fog_kappa),
                     float(fog_gamma),
+                    float(n_pulses),
                     smoke_templates,
                     float(smoke_step_used),
                 )
@@ -1627,6 +1672,12 @@ def parse_args() -> argparse.Namespace:
         choices=["auto", "clear", "smoke"],
         default="auto",
         help="Histogram likelihood model: auto uses fog_model ray_integral metadata when present.",
+    )
+    ap.add_argument(
+        "--n-pulses",
+        type=int,
+        default=None,
+        help="Laser pulse count for count-domain smoke likelihood; overrides capture_model metadata.",
     )
     ap.add_argument("--range_model", choices=["range", "z"], default="range")
     ap.add_argument("--max_peaks", type=int, default=2)

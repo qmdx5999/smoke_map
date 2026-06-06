@@ -6,11 +6,11 @@
 
 # 当前项目状态
 
-更新时间：2026-06-05。
+更新时间：2026-06-06。
 
 当前目录 `D:\pythonProgram\smoke_map` 是一个围绕 Single-Photon LiDAR / SPAD / TCSPC photon histogram（光子到达直方图）做三维占据建图的研究原型。核心目标是避免先把 histogram（直方图）压成单一 depth（深度）或 point cloud（点云），而是把 histogram-level uncertainty（直方图级不确定性）直接传进 occupancy mapping（占据建图）。
 
-当前主线已经完成从 ICL-NUIM 连续 RGB-D 序列生成 SPAD histogram（光子直方图）、读取多帧 `T_wc` 位姿、从 range posterior（距离后验）做 CDF-marginalized occupancy update（CDF 边缘化占据更新），并输出 surface point cloud（表面点云）、occupied voxel cloud（占据体素点云）和完整 dense log-odds grid（稠密对数几率栅格）。截至 2026-06-05，仿真数据生成端 `generate_spad_data_icl.py` 已新增 per-pixel ray-integral smoke/fog forward model（逐像素射线积分烟雾/雾前向模型），但建图端 `spad_npz_occupancy_mapping.py` 仍是原来的 surface + constant background likelihood（表面 + 常数背景似然），尚未加入 smoke-aware likelihood（烟雾感知似然）。
+当前主线已经完成从 ICL-NUIM 连续 RGB-D 序列生成 SPAD histogram（光子直方图）、读取多帧 `T_wc` 位姿、从 range posterior（距离后验）做 CDF-marginalized occupancy update（CDF 边缘化占据更新），并输出 surface point cloud（表面点云）、occupied voxel cloud（占据体素点云）和完整 dense log-odds grid（稠密对数几率栅格）。截至 2026-06-06，仿真端 `generate_spad_data_icl.py` 已支持 per-pixel ray-integral smoke/fog forward model（逐像素射线积分烟雾/雾前向模型），建图端 `spad_npz_occupancy_mapping.py` 也已加入第一版 smoke-aware likelihood（烟雾感知似然），并修正到与 `spad_hist` 一致的 accumulated-count domain（累计计数域）。当前改动只涉及 measurement likelihood（测量似然）和 range posterior（距离后验）；后续 CDF occupancy update（CDF 占据更新）仍保持原实现。
 
 当前主要文件与目录：
 
@@ -23,6 +23,7 @@
 ├── export_occupancy_from_grid.py
 ├── generate_spad_data.py
 ├── generate_spad_data_icl.py
+├── diagnose_smoke_likelihood.py
 ├── plot_pixel_histogram.py
 ├── view_npz.py
 ├── visualize_npz2pointcloud.py
@@ -95,6 +96,27 @@ gt_range     : (256, 256), float32  # ToF/ray range（沿射线欧氏距离）
 gt_depth     : (256, 256), float32  # 兼容字段，当前等于 gt_depth_z
 camera_model : JSON metadata string
 fog_model    : JSON metadata string  # 有雾/无雾仿真模型元数据，新版生成脚本会写入
+capture_model: JSON metadata string  # SPAD capture（采样）参数，新版生成脚本会写入
+```
+
+`capture_model` 当前至少包含：
+
+```json
+{
+  "sensor": "SwissSPAD2",
+  "n_pulses": 5000,
+  "tmax_ns": 100.0,
+  "n_tbins": 1000,
+  "fwhm_ns": 0.5,
+  "fast_sim": true,
+  "sampling": "Poisson(phi_bar * n_pulses)"
+}
+```
+
+旧版已经生成的 `.npz` 可能没有 `capture_model`。使用 smoke likelihood（烟雾似然）时，累计脉冲数是必需参数：建图端优先使用命令行 `--n-pulses`，其次读取 `capture_model.n_pulses`；两者都缺少时会直接报错。对当前旧有雾数据应显式传入：
+
+```powershell
+--n-pulses 5000
 ```
 
 如果 `generate_spad_data_icl.py` 开启 `--save-phi-bar`，还会保存：
@@ -139,9 +161,12 @@ phi_dark          : (256, 256, 1000), float32  # 暗计数
 |---|---|
 | Poisson likelihood（泊松似然） | `poisson_ll_numba()` |
 | profile likelihood（剖面似然）消去 `a,beta` | `profile_ll_one_r_numba()` |
+| accumulated-count smoke profile likelihood（累计计数域烟雾剖面似然） | `fit_profile_one_r_smoke_count_numba()` / `profile_ll_one_r_smoke_count_numba()` |
 | Gaussian IRF（高斯系统响应） | `build_S_gaussian()` |
+| smoke integral template（烟雾积分模板） | `build_smoke_integral_templates()` |
 | peak detection（峰值检测） | `mp_find_peaks()` |
 | range hypothesis grid（距离假设网格） | `compute_ll_grid_numba()` |
+| smoke-aware range hypothesis grid（烟雾感知距离假设网格） | `compute_ll_grid_smoke_numba()` |
 | posterior softmax（后验归一化） | `compute_ll_grid_numba()` |
 | posterior CDF（后验累积分布） | `cdf_lookup_numba()` |
 | CDF occupancy update（CDF 占据更新） | `dda_update_dense_cdf()` |
@@ -150,6 +175,9 @@ phi_dark          : (256, 256, 1000), float32  # 暗计数
 | ray density normalization（射线密度归一化） | `--ray-norm-target` 与 `--update-scale` 控制每帧更新强度 |
 | range / z 模型切换 | `--range_model range|z`，ICL 多帧推荐 `range` |
 | camera metadata（相机元数据）读取 | `load_spad_frame_npz()` 读取 `camera_model` |
+| fog/capture metadata（烟雾/采样元数据）读取 | `load_spad_frame_npz()` 读取 `fog_model` 与 `capture_model` |
+| likelihood mode（似然模式）选择 | `resolve_likelihood_model()` 与 `--likelihood-model auto|clear|smoke` |
+| pulse-count resolution（脉冲数解析） | `resolve_n_pulses()`，CLI `--n-pulses` 优先于 `capture_model.n_pulses` |
 | image y axis（图像 y 轴方向） | `--image-y-axis auto|down|up`，ICL 新数据自动取 `up` |
 | full grid dump（完整栅格导出） | `--grid-out` 保存 `Lgrid/mins/voxel`，`--grid-ply-out` 导出带 `occupancy` scalar（占据概率标量）的 PLY |
 | timing profile（耗时剖析） | `--profile` |
@@ -168,16 +196,50 @@ phi_dark          : (256, 256, 1000), float32  # 暗计数
 --update-scale 0.01
 --ray-norm-target 10000
 --range_model range
+--likelihood-model auto
 --max_peaks 2
 --mp_thr 10.0
 --export-min-prob 0.51
 --image-y-axis auto
---diagnostic-checkpoints 5,50,all
+--diagnostic-checkpoints all
 ```
 
 `--image-y-axis auto` 对新 ICL `.npz` 会读取 `camera_model.image_y_axis=up`，并在建图时执行 `y_n_all = -y_n_all`。原因是 ICL `poses.txt` 的 `T_wc` 第二列来自 `cam_up`（图像上方向），而普通像素坐标 `y_n=(v-cy)/fy` 默认是 image-down（图像向下）约定。这个修正是多帧清晰配准的关键之一。
 
 `--range_model z` 在当前 dense-grid updater（稠密栅格更新器）里使用 world z（世界 z）解释距离，多帧 ICL 不推荐使用。当前 ICL SPAD transient（瞬态）按 `gt_range` 生成，应使用 `--range_model range`。
+
+## 当前 smoke-aware likelihood（烟雾感知似然）
+
+当前 clear likelihood（无烟雾似然）仍保留为：
+
+```text
+lambda_b(r) = alpha * S_b(r) + beta
+```
+
+第一版 smoke likelihood 使用与 `spad_hist` 相同的 accumulated-count domain（累计计数域）：
+
+```text
+lambda_b(r) = alpha * S_b(r)
+            + N_pulses * gamma * G_b(r; kappa)
+            + beta
+```
+
+其中：
+
+- `S_b(r)` 是候选距离 `r` 对应的 Gaussian surface template（高斯表面模板）。
+- `G_b(r; kappa)` 是从传感器到候选表面距离的 unit-density ray-integral smoke template（单位密度射线积分烟雾模板），其内部包含双程透过率 `exp(-2*kappa*s)`。
+- `kappa` 来自 `fog_model.extinction_1_per_m`，`gamma` 来自 `fog_model.density`。
+- `N_pulses` 来自 `--n-pulses` 或 `capture_model.n_pulses`，用于把单脉冲烟雾期望响应换算成累计 photon count（光子计数）。
+- `alpha` 是已经包含表面衰减的 effective surface count amplitude（有效表面计数幅度），profile likelihood（剖面似然）只优化非负 `alpha` 和 `beta`。
+- 当前代码不宣称能从自由 `alpha` 中分别恢复无雾反射强度 `a` 和 `exp(-2*kappa*r)` 消光衰减；若要分别识别二者，需要额外反照率、幅度先验或联合模型。
+
+smoke likelihood 对每个 peak proposal（峰候选）仍只在 `peak_bin ± Wr_bin` 的候选距离网格上计算 posterior（后验），但 likelihood window（似然窗口）使用从 bin 0 到 `peak_bin + win_half` 的 prefix window（前缀窗口），以利用表面前方的烟雾散射形状。
+
+`--likelihood-model` 行为：
+
+- `auto`：检测到 `fog_model.enabled=true` 且 `fog_model.model=ray_integral` 时使用 smoke likelihood，否则使用 clear likelihood。
+- `clear`：强制使用旧的 surface + constant background（表面 + 常数背景）模型，可作为有雾数据上的 baseline（基线）。
+- `smoke`：强制使用烟雾模型；缺少有效 `fog_model` 或 `n_pulses` 时直接报错。
 
 # 位姿文件 `poses.txt`
 
@@ -249,6 +311,7 @@ t_wc      = cam_pos
 - 输出 `.npz` 与 `poses.txt`，命名保持 `scene_00_xxxx`。
 - `camera_model` 写入 `depth_model=z`、`tof_model=range`、`image_y_axis=up`。
 - 新增 `fog_model` JSON metadata（雾模型元数据），记录 `fog_model`、`fog_extinction`、`fog_density`、`fog_step`、`fog_range_max`、`surface_attenuation` 和 `smoke_return`。
+- 新增 `capture_model` JSON metadata（采样模型元数据），记录 `n_pulses`、`tmax_ns`、`n_tbins`、`fwhm_ns`、`fast_sim` 和采样语义 `Poisson(phi_bar * n_pulses)`。
 - 当前只保留 `--fog-model none|ray_integral`。旧 `--fog` 和 `gamma` fog（Gamma 雾模型）接口已经移除。
 - `ray_integral` 是 per-pixel uniform-density ray integral（逐像素、均匀密度射线积分）模型：每个像素的烟雾积分上限是 `min(gt_range[u,v], fog_range_max, dmax)`，因此表面后方的 smoke/fog scattering（烟雾/雾散射）不会继续贡献到该像素。
 - 有雾时表面返回使用双程衰减：`phi_surface = phi_surface_clear * exp(-2 * fog_extinction * gt_range)`。
@@ -272,7 +335,7 @@ D:/Anaconda3/envs/pytorch/python.exe .\generate_spad_data_icl.py --in-dir .\livi
 --save-components
 ```
 
-注意：`--save-components` 会显著增大 `.npz` 体积。正式多帧建图数据通常不需要开启它；后续建图代码应主要读取 `spad_hist`、`camera_model`、`fog_model` 和 `poses.txt`，不应依赖 `phi_surface` / `phi_smoke` 等仿真真值分量。
+注意：`--save-components` 会显著增大 `.npz` 体积。正式多帧建图数据通常不需要开启它；后续建图代码应主要读取 `spad_hist`、`camera_model`、`fog_model`、`capture_model` 和 `poses.txt`，不应依赖 `phi_surface` / `phi_smoke` 等仿真真值分量。
 
 生成逐像素 `ray_integral` 有雾数据的推荐命令：
 
@@ -319,6 +382,18 @@ ICL 内参来源与缩放原因（刷新 AGENTS.md 时必须保留）：
 - 后续刷新或重写 `AGENTS.md` 时，不要只保留内参数值，必须保留“为什么要这样缩放”和“这些内参用于像素到 ray（射线）反投影”的解释。
 
 # 推荐建图命令
+
+有雾数据第一版 smoke-aware likelihood 建图命令，新版 `.npz` 已有 `capture_model` 时可以自动读取 `n_pulses`：
+
+```powershell
+D:/Anaconda3/envs/pytorch/python.exe .\spad_npz_occupancy_mapping.py --npz-dir out_fog_ray --poses out_fog_ray/poses.txt --fx 192.48 --fy 256.0 --cx 127.8 --cy 127.7333333 --range_model range --range_max 7.0 --image-y-axis auto --likelihood-model smoke --max_rays 10000 --update-scale 0.005 --ply-out fog_occ.ply --surface-out fog_surface.ply --grid-out fog.npz --profile
+```
+
+当前旧有雾数据没有 `capture_model` 时必须显式添加：
+
+```powershell
+--likelihood-model smoke --n-pulses 5000
+```
 
 100 帧快速验证：
 
@@ -424,6 +499,39 @@ D:/Anaconda3/envs/pytorch/python.exe .\export_occupancy_from_grid.py --grid .\fu
 
 `plot_pixel_histogram.py` 是像素级 histogram（直方图）快速查看脚本，会优先读取 `.npz` 中的 `phi_bar` 或 `spad_hist` 并保存 `histogram.png`。
 
+`diagnose_smoke_likelihood.py` 是独立的像素级 smoke likelihood diagnosis（烟雾似然诊断）工具。它用于在给定 surface proposal peak（表面候选峰）后：
+
+- 比较 clear posterior（无烟雾后验）和 smoke posterior（烟雾后验）。
+- 输出 clear/smoke MAP range（最大后验距离）及其相对 `gt_range` 的误差。
+- 将 smoke model 拆成 `fitted surface`、`fixed smoke`、`fitted background` 和 `fitted total`。
+- 检查固定烟雾分量是否已经按 `N_pulses * gamma * G` 转到累计计数尺度。
+
+该脚本默认使用 `np.argmax(spad_hist)` 作为 `peak_bin`，但强烟雾条件下全局最大 bin 可能是近距离 smoke return（烟雾返回），而不是真实表面。此时必须使用 `--peak-bin` 指定要诊断的表面候选，否则 `peak_bin ± Wr_bin` 的局部距离搜索不会覆盖真实表面。
+
+旧数据诊断示例：
+
+```powershell
+D:/Anaconda3/envs/pytorch/python.exe .\diagnose_smoke_likelihood.py --npz out/scene_00_1500.npz --row 50 --col 12 --n-pulses 5000 --peak-bin 263
+```
+
+当前验证记录：
+
+```text
+frame       : scene_00_1500
+pixel       : (50, 12)
+proposal bin: 263
+gt_range    : 3.938756 m
+clear_range : 3.924283 m, absolute error ≈ 1.45 cm
+smoke_range : 3.933277 m, absolute error ≈ 0.55 cm
+surface sum : 19.23 counts
+smoke sum   : 349.74 counts
+background  : 197.66 counts
+```
+
+此单像素结果说明累计计数域 smoke term（烟雾项）已经实际参与 posterior（后验）计算，但它只是局部 sanity check（合理性检查），不能替代多像素、多帧 benchmark（基准评测）。
+
+`gt_range` 在诊断脚本中只用于画参考线和计算误差，不参与 likelihood fit（似然拟合）。脚本也不会读取 `phi_surface`、`phi_smoke` 或 `phi_bar` 作为推断输入，因此不会把仿真真值泄漏给模型。
+
 `view_npz.py` 是 `.npz` 快速检查脚本，当前已经适配字符串型 `camera_model` metadata（元数据），不会再对非数值数组调用 `min/max/mean`。
 
 `raw2pc_undistortPoints.py` 和 `raw2pc_undistortPoints_single.py` 是面向 histogram txt 的传统点云转换脚本。当前目录没有对应 txt 数据和 `offset.txt`，所以它们主要作为旧 baseline 参考。
@@ -437,7 +545,10 @@ D:/Anaconda3/envs/pytorch/python.exe .\export_occupancy_from_grid.py --grid .\fu
 仍未完整实现或未验证的点：
 
 - 论文 forward model（前向模型）写的是多返回联合叠加 `lambda_b = sum_n a_n S(t_b - tau_n) + beta`；当前代码是 peak-anchored local posterior approximation（峰值锚定局部后验近似），不是联合 mixture model（混合模型）拟合。
-- 仿真端已经支持 per-pixel ray-integral smoke/fog（逐像素射线积分烟雾/雾）数据生成，但建图端 `spad_npz_occupancy_mapping.py` 还没有把 smoke/fog term（烟雾/雾项）加入 profile likelihood（剖面似然）。当前建图似然仍可概括为 `surface Gaussian pulse + constant background`（表面高斯脉冲 + 常数背景）。
+- 建图端已经加入第一版 accumulated-count smoke likelihood（累计计数域烟雾似然），但当前只支持已知、沿 ray 均匀的 `kappa/gamma`，参数来自仿真 `fog_model` metadata（元数据），尚未从观测数据估计未知烟雾参数或空间变化的烟雾场。
+- 当前 smoke likelihood 只修改 measurement likelihood（测量似然）和 range posterior（距离后验）；occupancy inverse sensor model（占据逆传感器模型）及 CDF occupancy update（CDF 占据更新）仍是原来的 surface/free/unknown 语义，尚未实现 smoke-aware occupancy update（烟雾感知占据更新）或 smoke density map（烟雾密度地图）。
+- 当前 `--max_peaks` 默认固定为 `2`，且 posterior 仍依赖 peak proposal（峰候选）。强烟雾下全局最大峰可能是 smoke return（烟雾返回）而不是真实表面；自适应峰数量、surface peak filtering（表面峰筛选）和 coarse-to-fine full-range posterior（粗到细全距离后验）尚未实现。
+- 尚未实现显式的 `surface / smoke / background` latent classification（潜变量分类）。当前诊断脚本需要给定正确的 surface proposal peak（表面候选峰），并不负责自动判断某个峰属于表面还是烟雾。
 - 当前有雾仿真是 uniform-density single-scattering approximation（均匀密度单次散射近似），还不是完整 3D smoke density field（烟雾密度场）、phase function（相函数）或 multiple scattering（多次散射）模型。
 - 当前 SPAD capture（采样）仍不模拟 first-photon pile-up（首光子堆积）/ detector dead time（探测器死时间）
 - 当前只使用 Gaussian IRF（高斯系统响应），没有 measured IRF（实测系统响应）加载。

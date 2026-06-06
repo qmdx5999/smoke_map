@@ -310,6 +310,19 @@ def build_fog_model_metadata(args: argparse.Namespace, dmax: float) -> str:
     return json.dumps(fog_model, sort_keys=True)
 
 
+def build_capture_model_metadata() -> str:
+    capture_model = {
+        "sensor": "SwissSPAD2",
+        "n_pulses": int(N_PULSES),
+        "tmax_ns": float(TMAX),
+        "n_tbins": int(N_TBINS),
+        "fwhm_ns": float(FWHM),
+        "fast_sim": True,
+        "sampling": "Poisson(phi_bar * n_pulses)",
+    }
+    return json.dumps(capture_model, sort_keys=True)
+
+
 def generate_one_scene(
     rgb: np.ndarray,
     depth_m: np.ndarray,
@@ -570,6 +583,7 @@ def main() -> None:
             "gt_depth": gt_depth_z,
             "camera_model": np.asarray(camera_model),
             "fog_model": np.asarray(build_fog_model_metadata(args, 3e8 * TMAX * 1e-9 / 2)),
+            "capture_model": np.asarray(build_capture_model_metadata()),
         }
         if phi_bar is not None:
             save_dict["phi_bar"] = phi_bar
