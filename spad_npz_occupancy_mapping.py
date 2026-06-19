@@ -8,6 +8,7 @@ the laser period and number of bins.
 """
 
 import argparse
+import csv
 import json
 import math
 import os
@@ -375,6 +376,51 @@ def profile_ll_one_r_smoke_count_numba(h, S, G, smoke_scale, eps=1e-6, max_iter=
 
 
 @njit(cache=True, fastmath=True)
+def fit_smoke_background_only_numba(h, G, smoke_scale, eps=1e-6, max_iter=12):
+    """Fit H0: lambda = smoke_scale * G + beta with beta >= 0."""
+    scale = max(smoke_scale, 0.0)
+    beta = 0.0
+    smoke_sum = 0.0
+    for i in range(h.size):
+        beta += h[i]
+        smoke_sum += scale * G[i]
+    beta = max((beta - smoke_sum) / max(1, h.size), 0.0)
+
+    lam = np.empty_like(h)
+    for _ in range(max_iter):
+        gradient = 0.0
+        hessian = 0.0
+        for i in range(h.size):
+            lam_i = max(scale * G[i] + beta, eps)
+            lam[i] = lam_i
+            gradient += h[i] / lam_i - 1.0
+            hessian += -h[i] / (lam_i * lam_i)
+        if abs(gradient) < 1e-6 or (not math.isfinite(hessian)) or abs(hessian) < 1e-18:
+            break
+
+        base_ll = poisson_ll_numba(h, lam)
+        delta = gradient / hessian
+        step = 1.0
+        ok = False
+        for __ in range(10):
+            beta_new = max(beta - step * delta, 0.0)
+            for i in range(h.size):
+                lam[i] = max(scale * G[i] + beta_new, eps)
+            ll_new = poisson_ll_numba(h, lam)
+            if math.isfinite(ll_new) and ll_new >= base_ll - 1e-10:
+                beta = beta_new
+                ok = True
+                break
+            step *= 0.5
+        if not ok:
+            break
+
+    for i in range(h.size):
+        lam[i] = max(scale * G[i] + beta, eps)
+    return poisson_ll_numba(h, lam), beta
+
+
+@njit(cache=True, fastmath=True)
 def build_S_gaussian(idx0, idx1, rbin, sigma_bins):
     """
     给定一个候选距离rbin，生成一个和直方图窗口一样长的高斯脉冲模板，模拟如果墙正好在rbin这个距离，我们应该看到的光子分布形状
@@ -527,7 +573,7 @@ def compute_ll_grid_numba(h, peak_bin, Wr_bin, M, win_half, sigma_bins, tau, bin
 
 
 @njit(cache=True, fastmath=True)
-def compute_ll_grid_smoke_numba(
+def compute_ll_grid_smoke_details_numba(
     h,
     peak_bin,
     Wr_bin,
@@ -561,8 +607,10 @@ def compute_ll_grid_smoke_numba(
 
     # 初始化 likelihood 数组,ll[k] 用来存第 k 个候选距离的 log-likelihood
     ll = np.empty(M, dtype=np.float64)
-    r0 = peak_bin - Wr_bin
-    r1 = peak_bin + Wr_bin
+    alpha_grid = np.empty(M, dtype=np.float64)
+    beta_grid = np.empty(M, dtype=np.float64)
+    r0 = max(0, peak_bin - Wr_bin)
+    r1 = min(B - 1, peak_bin + Wr_bin)
     step = 0.0 if M == 1 else (r1 - r0) / (M - 1)
 
     # 遍历每个候选距离
@@ -591,7 +639,9 @@ def compute_ll_grid_smoke_numba(
         # 计算当前候选距离的 log-likelihood,在候选距离 rb 下，当前 histogram 被 smoke-aware model 解释得有多好,数值越大，这个候选距离越可能
         # ll[i] = log p(h | r_i),意思是如果真实表面距离是第 i 个候选距离 r_i，那么观测到当前 SPAD histogram h 的可能性有多大
         smoke_scale = max(n_pulses, 0.0) * max(gamma, 0.0)
-        ll[k] = profile_ll_one_r_smoke_count_numba(h_w, S, G, smoke_scale)
+        ll[k], alpha_grid[k], beta_grid[k] = fit_profile_one_r_smoke_count_numba(
+            h_w, S, G, smoke_scale
+        )
 
     t = max(tau, 1e-6)
     
@@ -634,7 +684,86 @@ def compute_ll_grid_smoke_numba(
         r_grid_m[i] = (r0 + step * i) * bin_to_m
     
     # 候选距离网格，单位是米;后验概率的累计分布;每个候选距离的后验概率
+    return r_grid_m, cdf, p, ll, alpha_grid, beta_grid
+
+
+@njit(cache=True, fastmath=True)
+def compute_ll_grid_smoke_numba(
+    h,
+    peak_bin,
+    Wr_bin,
+    M,
+    win_half,
+    sigma_bins,
+    tau,
+    bin_to_m,
+    gamma,
+    n_pulses,
+    smoke_templates,
+    smoke_step_m,
+):
+    r_grid_m, cdf, p, _, _, _ = compute_ll_grid_smoke_details_numba(
+        h,
+        peak_bin,
+        Wr_bin,
+        M,
+        win_half,
+        sigma_bins,
+        tau,
+        bin_to_m,
+        gamma,
+        n_pulses,
+        smoke_templates,
+        smoke_step_m,
+    )
     return r_grid_m, cdf, p
+
+
+@njit(cache=True, fastmath=True)
+def evaluate_smoke_peak_h0_numba(
+    h,
+    peak_bin,
+    Wr_bin,
+    M,
+    win_half,
+    bin_to_m,
+    gamma,
+    n_pulses,
+    smoke_templates,
+    smoke_step_m,
+    map_idx,
+):
+    """Evaluate H0 once at the MAP candidate of a smoke posterior."""
+    B = h.size
+    b1 = peak_bin + win_half + 1
+    if b1 > B:
+        b1 = B
+    if b1 <= 0:
+        b1 = B
+
+    h_w = np.empty(b1, dtype=np.float64)
+    for i in range(b1):
+        h_w[i] = h[i]
+
+    r0 = max(0, peak_bin - Wr_bin)
+    r1 = min(B - 1, peak_bin + Wr_bin)
+    step = 0.0 if M == 1 else (r1 - r0) / (M - 1)
+    rb = r0 + step * map_idx
+    r_m = rb * bin_to_m
+    row = int(math.floor(max(r_m, 0.0) / max(smoke_step_m, 1e-12)))
+    if row < 0:
+        row = 0
+    if row >= smoke_templates.shape[0]:
+        row = smoke_templates.shape[0] - 1
+    G = np.empty(b1, dtype=np.float64)
+    for i in range(b1):
+        G[i] = smoke_templates[row, i]
+
+    smoke_scale = max(n_pulses, 0.0) * max(gamma, 0.0)
+    ll_h0, beta_h0 = fit_smoke_background_only_numba(
+        h_w, G, smoke_scale
+    )
+    return ll_h0, beta_h0
 
 
 @njit(cache=True, fastmath=True)
@@ -1062,6 +1191,17 @@ def load_spad_hist_npz(path: Path) -> np.ndarray:
     return spad_hist
 
 
+def load_optional_gt_range_npz(path: Path) -> Optional[np.ndarray]:
+    """Load gt_range for diagnostics only; it is never used by inference."""
+    with np.load(path) as data:
+        if "gt_range" not in data:
+            return None
+        gt_range = np.asarray(data["gt_range"], dtype=np.float64)
+    if gt_range.ndim != 2:
+        raise ValueError(f"{path}: gt_range must have shape (H, W), got {gt_range.shape}")
+    return gt_range
+
+
 def discover_npz_frames(npz_dir: str, max_frames: int) -> List[Path]:
     """输出按文件名升序排列的.npz 文件路径列表"""
     root = Path(npz_dir)
@@ -1339,6 +1479,9 @@ def process_frame(
     mins: np.ndarray,
     voxel: float,
     args: argparse.Namespace,
+    gt_range: Optional[np.ndarray] = None,
+    peak_filter_csv_writer=None,
+    peak_filter_warning_state: Optional[Dict[str, bool]] = None,
 ) -> Tuple[List[Tuple[float, float, float, float]], Dict[str, float]]:
     H, W, B = spad_hist.shape
     hist_data = spad_hist.reshape(H * W, B).astype(np.float64)
@@ -1349,6 +1492,15 @@ def process_frame(
     # 从当前帧的 metadata 中解析烟雾模型设置，并结合命令行参数决定这帧用 clear 还是 smoke；如果用 smoke，就取出烟雾消光系数、烟雾密度和积分步长
     likelihood_model, fog_kappa, fog_gamma, fog_step_m = resolve_likelihood_model(args, frame_metadata)
     n_pulses = resolve_n_pulses(args, frame_metadata, likelihood_model)
+    peak_filter_active = bool(args.smoke_peak_filter) and likelihood_model == "smoke"
+    if bool(args.smoke_peak_filter) and likelihood_model != "smoke":
+        state = peak_filter_warning_state if peak_filter_warning_state is not None else {}
+        if not bool(state.get("clear_skip_emitted", False)):
+            print(
+                "warning: --smoke-peak-filter is enabled, but the active likelihood is clear; "
+                "peak filtering will be skipped. This warning is printed once per run."
+            )
+            state["clear_skip_emitted"] = True
     smoke_templates = np.zeros((1, B), dtype=np.float64)
     smoke_step_used = max(float(fog_step_m), 1e-6)
     if likelihood_model == "smoke":
@@ -1424,6 +1576,12 @@ def process_frame(
     cand = np.where(mx >= args.peak_thr)[0]
     print(f"[{frame_key}] candidate rays: {cand.size}")
     if cand.size == 0:
+        if bool(args.print_peak_filter_stats) and peak_filter_active:
+            print(
+                f"[peak-filter] frame={frame_key} total_peaks=0 accepted_surface_peaks=0 "
+                "rejected_peaks=0 rejected_by_delta_ll=0 rejected_by_alpha=0 "
+                "mean_delta_ll=nan median_delta_ll=nan mean_alpha=nan median_alpha=nan"
+            )
         return [], {
             "rays_total": 0.0,
             "rays_with_peaks": 0.0,
@@ -1474,6 +1632,15 @@ def process_frame(
     rays_with_peaks = 0
     rays_fused = 0
     posterior_evals = 0
+    filter_total_peaks = 0
+    filter_accepted_peaks = 0
+    filter_rejected_peaks = 0
+    filter_rejected_by_delta_ll = 0
+    filter_rejected_by_alpha = 0
+    filter_delta_ll_values: List[float] = []
+    filter_alpha_values: List[float] = []
+    accepted_errors: List[float] = []
+    rejected_errors: List[float] = []
     frame_t0 = time.time()
 
     for k, idx in enumerate(rays):
@@ -1501,22 +1668,52 @@ def process_frame(
 
         for pk, pk_score in zip(peaks, peak_scores):
             _tp = time.perf_counter()
-            # 计算距离后验
+            
+            # 如果是烟雾模式似然
             if likelihood_model == "smoke":
-                r_grid_m, _, pdf_grid = compute_ll_grid_smoke_numba(
-                    h,
-                    int(pk),
-                    int(args.Wr_bin),
-                    int(args.M),
-                    int(args.win_half),
-                    float(args.sigma_bins),
-                    float(args.tau),
-                    float(bin_to_m),
-                    float(fog_gamma),
-                    float(n_pulses),
-                    smoke_templates,
-                    float(smoke_step_used),
-                )
+                
+                # 如果开启烟雾峰过滤器
+                if peak_filter_active:
+                    (
+                        r_grid_m,
+                        _,
+                        pdf_grid,
+                        ll_grid,
+                        alpha_grid,
+                        beta_grid,
+                    ) = compute_ll_grid_smoke_details_numba(
+                        h,
+                        int(pk),
+                        int(args.Wr_bin),
+                        int(args.M),
+                        int(args.win_half),
+                        float(args.sigma_bins),
+                        float(args.tau),
+                        float(bin_to_m),
+                        float(fog_gamma),
+                        float(n_pulses),
+                        smoke_templates,
+                        float(smoke_step_used),
+                    )
+                
+                # 关闭过滤器
+                else:
+                    r_grid_m, _, pdf_grid = compute_ll_grid_smoke_numba(
+                        h,
+                        int(pk),
+                        int(args.Wr_bin),
+                        int(args.M),
+                        int(args.win_half),
+                        float(args.sigma_bins),
+                        float(args.tau),
+                        float(bin_to_m),
+                        float(fog_gamma),
+                        float(n_pulses),
+                        smoke_templates,
+                        float(smoke_step_used),
+                    )
+            
+            # 无烟似然
             else:
                 r_grid_m, _, pdf_grid = compute_ll_grid_numba(
                     h,
@@ -1536,8 +1733,84 @@ def process_frame(
             # 后验概率最大的位置对应的深度值和置信度
             peak_depth = float(r_grid_m[pk_local])
             peak_conf = float(pdf_grid[pk_local])
+
+            # Reject out-of-range MAP estimates before H0 evaluation or filter statistics.
             if peak_depth <= 0.0 or peak_depth > end_dist:
                 continue
+
+            if peak_filter_active:
+                # 取出 MAP 距离处的 H1 拟合结果
+                # H1 模型在 MAP 距离处的 log-likelihood（对数似然）
+                ll_h1 = float(ll_grid[pk_local])
+                alpha = float(alpha_grid[pk_local])
+                beta_h1 = float(beta_grid[pk_local])
+                
+                # 在同一个 MAP 距离计算 H0
+                ll_h0, beta_h0 = evaluate_smoke_peak_h0_numba(
+                    h,
+                    int(pk),
+                    int(args.Wr_bin),
+                    int(args.M),
+                    int(args.win_half),
+                    float(bin_to_m),
+                    float(fog_gamma),
+                    float(n_pulses),
+                    smoke_templates,
+                    float(smoke_step_used),
+                    int(pk_local),
+                )
+                delta_ll = float(ll_h1 - ll_h0)
+                rejected_by_delta_ll = delta_ll < float(args.surface_dll_min)
+                rejected_by_alpha = alpha < float(args.surface_alpha_min)
+                accepted = not (rejected_by_delta_ll or rejected_by_alpha)
+
+                filter_total_peaks += 1
+                filter_delta_ll_values.append(delta_ll)
+                filter_alpha_values.append(alpha)
+                if accepted:
+                    filter_accepted_peaks += 1
+                else:
+                    filter_rejected_peaks += 1
+                if rejected_by_delta_ll:
+                    filter_rejected_by_delta_ll += 1
+                if rejected_by_alpha:
+                    filter_rejected_by_alpha += 1
+
+                row = int(idx // W)
+                col = int(idx % W)
+                gt_value = math.nan
+                abs_range_error = math.nan
+                if gt_range is not None:
+                    gt_value = float(gt_range[row, col])
+                    if math.isfinite(gt_value) and gt_value > 0.0:
+                        abs_range_error = abs(peak_depth - gt_value)
+                        if accepted:
+                            accepted_errors.append(abs_range_error)
+                        else:
+                            rejected_errors.append(abs_range_error)
+                if peak_filter_csv_writer is not None:
+                    peak_filter_csv_writer.writerow({
+                        "frame": frame_key,
+                        "row": row,
+                        "col": col,
+                        "peak_bin": int(pk),
+                        "peak_score": float(pk_score),
+                        "r_hat": peak_depth,
+                        "alpha": alpha,
+                        "beta_h1": float(beta_h1),
+                        "ll_h1": float(ll_h1),
+                        "beta_h0": float(beta_h0),
+                        "ll_h0": float(ll_h0),
+                        "delta_ll": delta_ll,
+                        "accepted": int(accepted),
+                        "rejected_by_delta_ll": int(rejected_by_delta_ll),
+                        "rejected_by_alpha": int(rejected_by_alpha),
+                        "gt_range": gt_value if math.isfinite(gt_value) else "",
+                        "abs_range_error": abs_range_error if math.isfinite(abs_range_error) else "",
+                    })
+                if not accepted:
+                    continue
+
             peak_posteriors_r.append(r_grid_m)
             peak_posteriors_p.append(pdf_grid * peak_weight)
             profile_points.append((peak_depth, peak_conf))
@@ -1612,6 +1885,34 @@ def process_frame(
             elapsed = round(time.time() - frame_t0, 1)
             print(f"[{frame_key}] processed rays: {k + 1} / {rays.size} elapsed(s)= {elapsed}")
 
+    if bool(args.print_peak_filter_stats) and peak_filter_active:
+        delta_values = np.asarray(filter_delta_ll_values, dtype=np.float64)
+        alpha_values = np.asarray(filter_alpha_values, dtype=np.float64)
+        mean_delta = float(np.mean(delta_values)) if delta_values.size else math.nan
+        median_delta = float(np.median(delta_values)) if delta_values.size else math.nan
+        mean_alpha = float(np.mean(alpha_values)) if alpha_values.size else math.nan
+        median_alpha = float(np.median(alpha_values)) if alpha_values.size else math.nan
+        print(
+            f"[peak-filter] frame={frame_key} total_peaks={filter_total_peaks} "
+            f"accepted_surface_peaks={filter_accepted_peaks} rejected_peaks={filter_rejected_peaks} "
+            f"rejected_by_delta_ll={filter_rejected_by_delta_ll} "
+            f"rejected_by_alpha={filter_rejected_by_alpha} "
+            f"mean_delta_ll={mean_delta:.6g} median_delta_ll={median_delta:.6g} "
+            f"mean_alpha={mean_alpha:.6g} median_alpha={median_alpha:.6g}"
+        )
+        if accepted_errors or rejected_errors:
+            accepted_error_mean = float(np.mean(accepted_errors)) if accepted_errors else math.nan
+            accepted_error_median = float(np.median(accepted_errors)) if accepted_errors else math.nan
+            rejected_error_mean = float(np.mean(rejected_errors)) if rejected_errors else math.nan
+            rejected_error_median = float(np.median(rejected_errors)) if rejected_errors else math.nan
+            print(
+                f"[peak-filter-error] frame={frame_key} "
+                f"accepted_n={len(accepted_errors)} accepted_mean={accepted_error_mean:.6g} "
+                f"accepted_median={accepted_error_median:.6g} "
+                f"rejected_n={len(rejected_errors)} rejected_mean={rejected_error_mean:.6g} "
+                f"rejected_median={rejected_error_median:.6g}"
+            )
+
     print(f"[{frame_key}] done. elapsed(s)= {round(time.time() - frame_t0, 2)}")
     
     return surface_points, {
@@ -1619,6 +1920,11 @@ def process_frame(
         "rays_with_peaks": float(rays_with_peaks),
         "rays_fused": float(rays_fused),
         "posterior_evals": float(posterior_evals),
+        "filter_total_peaks": float(filter_total_peaks),
+        "filter_accepted_peaks": float(filter_accepted_peaks),
+        "filter_rejected_peaks": float(filter_rejected_peaks),
+        "filter_rejected_by_delta_ll": float(filter_rejected_by_delta_ll),
+        "filter_rejected_by_alpha": float(filter_rejected_by_alpha),
         "t_peak": t_peak,
         "t_posterior": t_posterior,
         "t_merge": t_merge,
@@ -1679,9 +1985,46 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Laser pulse count for count-domain smoke likelihood; overrides capture_model metadata.",
     )
+    
+    # 启用 H1/H0 表面证据过滤
+    ap.add_argument(
+        "--smoke-peak-filter",
+        action="store_true",
+        help="Filter smoke-likelihood peaks using MAP H1-vs-H0 evidence before occupancy fusion.",
+    )
+    
+    # delta_ll 的最低阈值
+    ap.add_argument(
+        "--surface-dll-min",
+        type=float,
+        default=10.0,
+        help="Minimum LL(H1)-LL(H0) required to retain a smoke-likelihood peak.",
+    )
+    
+    # 拟合表面幅度 alpha 的最低阈值
+    ap.add_argument(
+        "--surface-alpha-min",
+        type=float,
+        default=0.5,
+        help="Minimum fitted effective surface amplitude required to retain a smoke-likelihood peak.",
+    )
+    
+    # 加上它后程序会打印每帧过滤统计信息
+    ap.add_argument(
+        "--print-peak-filter-stats",
+        action="store_true",
+        help="Print per-frame smoke peak-filter counts and distribution summaries.",
+    )
+    
+    # 每个被评估的 peak proposal（峰候选）写成一行
+    ap.add_argument(
+        "--peak-filter-details-csv",
+        default=None,
+        help="Optional CSV path for one diagnostic row per evaluated smoke peak.",
+    )
     ap.add_argument("--range_model", choices=["range", "z"], default="range")
-    ap.add_argument("--max_peaks", type=int, default=2)
-    ap.add_argument("--mp_thr", type=float, default=10.0)
+    ap.add_argument("--max_peaks", type=int, default=3)
+    ap.add_argument("--mp_thr", type=float, default=2.0)
     ap.add_argument("--mp_support", type=int, default=0, help="support radius in bins, 0=auto(4*sigma)")
     ap.add_argument("--export-min-prob", type=float, default=0.51)
     ap.add_argument("--max_out", type=int, default=0)
@@ -1703,6 +2046,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    for name in ("surface_dll_min", "surface_alpha_min"):
+        value = float(getattr(args, name))
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"--{name.replace('_', '-')} must be finite and non-negative")
     multi_frame = args.npz_dir is not None
     if multi_frame and args.poses is None:
         raise ValueError("--poses is required when using --npz-dir")
@@ -1746,9 +2093,11 @@ def main() -> None:
 
     # 收集所有帧检测到的表面点云，每个元素是一个包含 4 个浮点数的元组：(x, y, z, conf)
     all_surface_points: List[Tuple[float, float, float, float]] = []
-    # 用来累计统计整个多帧处理过程的各项性能指标
-    # rays_total:所有帧总共处理的射线数量;rays_with_peaks:所有帧中检测到有效峰值的射线数量;rays_fused:所有帧中成功融合到地图中的射线数量
-    # posterior_evals:所有帧中总共计算的距离后验次数;t_peak:所有帧中峰值检测阶段的总耗时;t_posterior:所有帧中后验似然计算阶段的总耗时
+    # 用来累计整个多帧建图过程中的统计量
+    # rays_total:所有帧中实际处理过的 ray（射线）总数;rays_with_peaks:成功检测到至少一个 peak（峰）的 ray（射线）数量;
+    # rays_fused:最终真正进入 occupancy fusion（占据融合）的 ray（射线）数量;posterior_evals:总共计算了多少次 peak posterior（峰距离后验概率）
+    # filter_total_peaks:总共进入 smoke peak filter（烟雾峰过滤器）评估的峰数量
+    # t_peak:所有帧中峰值检测阶段的总耗时;t_posterior:所有帧中后验似然计算阶段的总耗时
     # t_merge:所有帧中后验合并与熵计算阶段的总耗时;t_surface:所有帧中表面点生成阶段的总耗时;t_dda:所有帧中 DDA 地图更新阶段的总耗时
     # 所有帧处理完成后，如果开启了--profile参数，这些统计值会被打印出来，方便分析性能瓶颈
     totals = {
@@ -1756,6 +2105,11 @@ def main() -> None:
         "rays_with_peaks": 0.0,
         "rays_fused": 0.0,
         "posterior_evals": 0.0,
+        "filter_total_peaks": 0.0,
+        "filter_accepted_peaks": 0.0,
+        "filter_rejected_peaks": 0.0,
+        "filter_rejected_by_delta_ll": 0.0,
+        "filter_rejected_by_alpha": 0.0,
         "t_peak": 0.0,
         "t_posterior": 0.0,
         "t_merge": 0.0,
@@ -1763,6 +2117,23 @@ def main() -> None:
         "t_dda": 0.0,
     }
     t0 = time.time()
+    peak_filter_warning_state = {"clear_skip_emitted": False}
+    peak_filter_csv_file = None
+    peak_filter_csv_writer = None
+    if args.peak_filter_details_csv:
+        csv_path = Path(args.peak_filter_details_csv)
+        if csv_path.parent != Path("."):
+            csv_path.parent.mkdir(parents=True, exist_ok=True)
+        peak_filter_csv_file = open(csv_path, "w", newline="", encoding="utf-8")
+        fieldnames = [
+            "frame", "row", "col", "peak_bin", "peak_score", "r_hat",
+            "alpha", "beta_h1", "ll_h1", "beta_h0", "ll_h0", "delta_ll",
+            "accepted", "rejected_by_delta_ll", "rejected_by_alpha",
+            "gt_range", "abs_range_error",
+        ]
+        peak_filter_csv_writer = csv.DictWriter(peak_filter_csv_file, fieldnames=fieldnames)
+        peak_filter_csv_writer.writeheader()
+        print(f"peak-filter details CSV: {csv_path}")
     # 用来累计保存所有已处理帧的 3D bounding box
     accumulated_bbox: Optional[Tuple[np.ndarray, np.ndarray]] = None
 
@@ -1772,6 +2143,16 @@ def main() -> None:
         print(f"loading frame {frame_i}/{len(frames)}: {frame_path}")
         # 从当前这一帧的 .npz 文件中读取 SPAD 直方图数据，以及可选的相机模型元数据
         spad_hist, frame_metadata = load_spad_frame_npz(frame_path)
+        gt_range = None
+        if bool(args.smoke_peak_filter) and (
+            bool(args.print_peak_filter_stats) or peak_filter_csv_writer is not None
+        ):
+            gt_range = load_optional_gt_range_npz(frame_path)
+            if gt_range is not None and gt_range.shape != spad_hist.shape[:2]:
+                raise ValueError(
+                    f"{frame_path}: gt_range shape {gt_range.shape} does not match "
+                    f"spad_hist spatial shape {spad_hist.shape[:2]}"
+                )
         # surface_points：当前帧估计出来的表面点列表，例如surface_points = [
         #     (0.2, -0.1, 1.5, 0.08),
         #     (0.5,  0.3, 2.0, 0.10),
@@ -1797,6 +2178,9 @@ def main() -> None:
             mins,
             voxel,
             args,
+            gt_range=gt_range,
+            peak_filter_csv_writer=peak_filter_csv_writer,
+            peak_filter_warning_state=peak_filter_warning_state,
         )
 
         # 当前帧生成的所有表面点在世界坐标系中的 3D bounding box,例如frame_bbox = (
@@ -1820,7 +2204,19 @@ def main() -> None:
         if frame_i in diagnostic_checkpoints:
             print_grid_diagnostics(f"frame {frame_i}", Lgrid, float(args.export_min_prob))
 
+    if peak_filter_csv_file is not None:
+        peak_filter_csv_file.close()
+
     print("all frames done. elapsed(s)=", round(time.time() - t0, 2))
+    if bool(args.smoke_peak_filter):
+        print(
+            "peak-filter totals: "
+            f"total_peaks={int(totals['filter_total_peaks'])} "
+            f"accepted_surface_peaks={int(totals['filter_accepted_peaks'])} "
+            f"rejected_peaks={int(totals['filter_rejected_peaks'])} "
+            f"rejected_by_delta_ll={int(totals['filter_rejected_by_delta_ll'])} "
+            f"rejected_by_alpha={int(totals['filter_rejected_by_alpha'])}"
+        )
     print("accumulated surface bbox", format_bbox(accumulated_bbox))
     _tp = time.perf_counter()
     if all_surface_points:

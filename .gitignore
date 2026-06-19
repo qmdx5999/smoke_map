@@ -11,3 +11,4 @@ out
 *.jpg
 plot_pixel_histogram.py
 generate_spad_data.py
+satat_out
